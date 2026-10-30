@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 #[derive(Default)]
 struct FxHasher {
@@ -56,29 +56,63 @@ fn parse_u32(bytes: &[u8]) -> u32 {
     v
 }
 
-struct ThreadResult<'a> {
-    endpoints: Vec<&'a [u8]>,
+struct ThreadResult {
+    endpoints: Vec<Vec<u8>>,
     groups: FxMap<u32, Group>,
 }
 
-fn aggregate(data: &[u8]) -> ThreadResult<'_> {
-    let mut intern: FxMap<&[u8], u16> = FxMap::default();
-    let mut endpoints: Vec<&[u8]> = Vec::new();
-    let mut groups: FxMap<u32, Group> = FxMap::default();
-    for line in data.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+// Aggregate only lines whose start offset lies in [start, end).
+fn aggregate_range(path: &str, start: u64, end: u64) -> ThreadResult {
+    let file = File::open(path).expect("open input");
+    let mut reader = BufReader::with_capacity(65536, file);
+    let mut pos = start;
+    if start > 0 {
+        // If start is mid-line, skip to the end of that line.
+        // If the byte before start is '\n', start is already a line start.
+        reader.seek(SeekFrom::Start(start - 1)).expect("seek");
+        let mut b = [0u8; 1];
+        reader.read_exact(&mut b).expect("peek");
+        pos = start;
+        if b[0] != b'\n' {
+            let mut tmp = Vec::new();
+            let n = reader.read_until(b'\n', &mut tmp).expect("skip line");
+            pos += n as u64;
         }
+    }
+
+    let mut intern: FxMap<Vec<u8>, u16> = FxMap::default();
+    let mut endpoints: Vec<Vec<u8>> = Vec::new();
+    let mut groups: FxMap<u32, Group> = FxMap::default();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if pos >= end {
+            break;
+        }
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).expect("read line");
+        if n == 0 {
+            break;
+        }
+        pos += n as u64;
+        let line: &[u8] = if buf.ends_with(b"\n") {
+            &buf[..buf.len() - 1]
+        } else {
+            &buf[..]
+        };
         let mut parts = line.split(|&b| b == b' ');
         let ts = parts.next().expect("ts");
         let _method = parts.next().expect("method");
         let endpoint = parts.next().expect("endpoint");
         let status = parts.next().expect("status");
         let latency = parts.next().expect("latency");
-        let eid = *intern.entry(endpoint).or_insert_with(|| {
-            endpoints.push(endpoint);
-            (endpoints.len() - 1) as u16
-        });
+        let eid = if let Some(&eid) = intern.get(endpoint) {
+            eid
+        } else {
+            let id = endpoints.len() as u16;
+            endpoints.push(endpoint.to_vec());
+            intern.insert(endpoint.to_vec(), id);
+            id
+        };
         let key = hour_index(ts) * 2048 + eid as u32;
         let g = groups.entry(key).or_insert_with(|| Group {
             lats: Vec::new(),
@@ -93,54 +127,46 @@ fn aggregate(data: &[u8]) -> ThreadResult<'_> {
 }
 
 fn main() {
-    let data = fs::read("/data/requests.log").expect("read input");
-
+    let path = "/data/requests.log";
+    let len = std::fs::metadata(path).expect("stat input").len();
     let nthreads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8)
         .min(12);
 
-    // Split at line boundaries: each chunk ends just after a '\n'.
-    let mut bounds: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
+    let mut bounds: Vec<(u64, u64)> = Vec::new();
     for i in 0..nthreads {
-        if i == nthreads - 1 {
-            bounds.push((start, data.len()));
-            break;
-        }
-        let mut end = start + data.len() / nthreads;
-        while end < data.len() && data[end] != b'\n' {
-            end += 1;
-        }
-        if end < data.len() {
-            end += 1;
-        }
-        bounds.push((start, end));
-        start = end;
+        let s = len * i as u64 / nthreads as u64;
+        let e = if i == nthreads - 1 {
+            len
+        } else {
+            len * (i + 1) as u64 / nthreads as u64
+        };
+        bounds.push((s, e));
     }
-	//altered from using move because it moved complete vector into 1st thread rather than reference it
-    let data_slice: &[u8] = &data;
 
-let results: Vec<ThreadResult> = std::thread::scope(|s| {
-    let handles: Vec<_> = bounds
-        .iter()
-        .map(|&(a, b)| s.spawn(move || aggregate(&data_slice[a..b])))
-        .collect();
-    handles.into_iter().map(|h| h.join().unwrap()).collect()
-});
+    let results: Vec<ThreadResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .iter()
+            .map(|&(a, b)| s.spawn(move || aggregate_range(path, a, b)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
-
-    // Merge: remap each thread's local endpoint ids to global ids.
-    let mut intern: FxMap<&[u8], u16> = FxMap::default();
-    let mut endpoints: Vec<&[u8]> = Vec::new();
+    let mut intern: FxMap<Vec<u8>, u16> = FxMap::default();
+    let mut endpoints: Vec<Vec<u8>> = Vec::new();
     let mut groups: FxMap<u32, Group> = FxMap::default();
     for tr in &results {
         let mut remap = vec![0u16; tr.endpoints.len()];
-        for (lid, &ep) in tr.endpoints.iter().enumerate() {
-            remap[lid] = *intern.entry(ep).or_insert_with(|| {
-                endpoints.push(ep);
-                (endpoints.len() - 1) as u16
-            });
+        for (lid, ep) in tr.endpoints.iter().enumerate() {
+            remap[lid] = if let Some(&gid) = intern.get(ep.as_slice()) {
+                gid
+            } else {
+                let gid = endpoints.len() as u16;
+                endpoints.push(ep.clone());
+                intern.insert(ep.clone(), gid);
+                gid
+            };
         }
         for (key, g) in &tr.groups {
             let gkey = (key / 2048) * 2048 + remap[(key % 2048) as usize] as u32;
@@ -158,11 +184,11 @@ let results: Vec<ThreadResult> = std::thread::scope(|s| {
         let (ha, ea) = (a / 2048, a % 2048);
         let (hb, eb) = (b / 2048, b % 2048);
         ha.cmp(&hb)
-            .then_with(|| endpoints[ea as usize].cmp(endpoints[eb as usize]))
+            .then_with(|| endpoints[ea as usize].cmp(&endpoints[eb as usize]))
     });
 
-    let out = fs::File::create("/out/summary.txt").expect("create output");
-    let mut w = BufWriter::new(out);
+    let out = std::fs::File::create("/out/summary.txt").expect("create output");
+    let mut w = std::io::BufWriter::new(out);
     for key in keys {
         let (hidx, eid) = (key / 2048, key % 2048);
         let g = groups.get_mut(&key).expect("group");
@@ -176,7 +202,7 @@ let results: Vec<ThreadResult> = std::thread::scope(|s| {
             w,
             "{} {} {} {} {} {} {} {}",
             hour_string(hidx),
-            std::str::from_utf8(endpoints[eid as usize]).expect("endpoint"),
+            std::str::from_utf8(&endpoints[eid as usize]).expect("endpoint"),
             n,
             p50,
             p95,
