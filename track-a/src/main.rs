@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Default)]
 struct FxHasher {
@@ -55,23 +55,62 @@ fn parse_u32(bytes: &[u8]) -> u32 {
     }
     v
 }
-fn find_space(data: &[u8], mut i: usize) -> usize {
+
+// SWAR search: 8 bytes at a time for `target`, scalar tail.
+fn find_byte(data: &[u8], mut i: usize, target: u8) -> Option<usize> {
+    let rep = (target as u64) * 0x0101010101010101;
     while i + 8 <= data.len() {
         let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let x = chunk ^ 0x2020202020202020;
+        let x = chunk ^ rep;
         let found = x
             .wrapping_sub(0x0101010101010101)
             & !x
             & 0x8080808080808080;
         if found != 0 {
-            return i + (found.trailing_zeros() / 8) as usize;
+            return Some(i + (found.trailing_zeros() / 8) as usize);
         }
         i += 8;
     }
-    while i < data.len() && data[i] != b' ' {
+    while i < data.len() {
+        if data[i] == target {
+            return Some(i);
+        }
         i += 1;
     }
-    i
+    None
+}
+
+fn process_line(
+    line: &[u8],
+    intern: &mut FxMap<Vec<u8>, u16>,
+    endpoints: &mut Vec<Vec<u8>>,
+    groups: &mut FxMap<u32, Group>,
+) {
+    let ts = &line[..27];
+    let method_end = find_byte(line, 28, b' ').expect("method end");
+    let endpoint_start = method_end + 1;
+    let endpoint_end = find_byte(line, endpoint_start, b' ').expect("endpoint end");
+    let endpoint = &line[endpoint_start..endpoint_end];
+    let status_start = endpoint_end + 1;
+    let status = line[status_start];
+    let latency = &line[status_start + 4..];
+    let eid = if let Some(&eid) = intern.get(endpoint) {
+        eid
+    } else {
+        let id = endpoints.len() as u16;
+        endpoints.push(endpoint.to_vec());
+        intern.insert(endpoint.to_vec(), id);
+        id
+    };
+    let key = hour_index(ts) * 2048 + eid as u32;
+    let g = groups.entry(key).or_insert_with(|| Group {
+        lats: Vec::new(),
+        errors: 0,
+    });
+    g.lats.push(parse_u32(latency));
+    if status == b'5' {
+        g.errors += 1;
+    }
 }
 
 struct ThreadResult {
@@ -81,68 +120,69 @@ struct ThreadResult {
 
 // Aggregate only lines whose start offset lies in [start, end).
 fn aggregate_range(path: &str, start: u64, end: u64) -> ThreadResult {
-    let file = File::open(path).expect("open input");
-    let mut reader = BufReader::with_capacity(65536, file);
-    let mut pos = start;
+    let mut file = File::open(path).expect("open input");
+    let mut skip_first = false;
     if start > 0 {
-        // If start is mid-line, skip to the end of that line.
-        // If the byte before start is '\n', start is already a line start.
-        reader.seek(SeekFrom::Start(start - 1)).expect("seek");
+        // Peek at the byte before start: '\n' means start is already a
+        // line start; otherwise start is mid-line and the first line
+        // we see is a tail belonging to the previous thread.
+        file.seek(SeekFrom::Start(start - 1)).expect("seek");
         let mut b = [0u8; 1];
-        reader.read_exact(&mut b).expect("peek");
-        pos = start;
-        if b[0] != b'\n' {
-            let mut tmp = Vec::new();
-            let n = reader.read_until(b'\n', &mut tmp).expect("skip line");
-            pos += n as u64;
-        }
+        file.read_exact(&mut b).expect("peek");
+        skip_first = b[0] != b'\n';
+        // Cursor is now exactly at `start`.
     }
 
     let mut intern: FxMap<Vec<u8>, u16> = FxMap::default();
     let mut endpoints: Vec<Vec<u8>> = Vec::new();
     let mut groups: FxMap<u32, Group> = FxMap::default();
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        if pos >= end {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut pos = start;
+    let mut eof = false;
+
+    'outer: loop {
+        // Process every complete line currently buffered.
+        let mut consumed = 0usize;
+        while let Some(nl) = find_byte(&pending[consumed..], 0, b'\n') {
+            let line_start = pos;
+            if line_start >= end {
+                break 'outer;
+            }
+            let line = &pending[consumed..consumed + nl];
+            if !skip_first {
+                process_line(line, &mut intern, &mut endpoints, &mut groups);
+            }
+            skip_first = false;
+            pos += (nl + 1) as u64;
+            consumed += nl + 1;
+        }
+        pending.drain(..consumed);
+        if eof {
             break;
         }
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf).expect("read line");
-        if n == 0 {
+        // Fill the next 1 MB block (short reads looped until full or EOF).
+        let mut filled = 0usize;
+        while filled < chunk.len() {
+            match file.read(&mut chunk[filled..]) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => filled += n,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        if filled == 0 {
+            // EOF with a final line lacking a trailing newline (the
+            // spec file ends with one, so this is only a safety net).
+            if !pending.is_empty() && pos < end && !skip_first {
+                let tail = pending.clone();
+                process_line(&tail, &mut intern, &mut endpoints, &mut groups);
+            }
             break;
         }
-        pos += n as u64;
-        let line: &[u8] = if buf.ends_with(b"\n") {
-            &buf[..buf.len() - 1]
-        } else {
-            &buf[..]
-        };
-        let mut parts = line.split(|&b| b == b' ');
-        let ts = &line[..27];
-        let method_end = find_space(line, 28);
-        let endpoint_start = method_end + 1;
-        let endpoint_end = find_space(line, endpoint_start);
-		let endpoint = &line[endpoint_start..endpoint_end];
-		let status_start = endpoint_end + 1;
-		let status = &line[status_start..status_start + 3];
-        let latency = &line[status_start + 4..];
-        let eid = if let Some(&eid) = intern.get(endpoint) {
-            eid
-        } else {
-            let id = endpoints.len() as u16;
-            endpoints.push(endpoint.to_vec());
-            intern.insert(endpoint.to_vec(), id);
-            id
-        };
-        let key = hour_index(ts) * 2048 + eid as u32;
-        let g = groups.entry(key).or_insert_with(|| Group {
-            lats: Vec::new(),
-            errors: 0,
-        });
-        g.lats.push(parse_u32(latency));
-        if status[0] == b'5' {
-            g.errors += 1;
-        }
+        pending.extend_from_slice(&chunk[..filled]);
     }
     ThreadResult { endpoints, groups }
 }
@@ -235,3 +275,4 @@ fn main() {
     }
     w.flush().expect("flush");
 }
+
