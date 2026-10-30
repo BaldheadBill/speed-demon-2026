@@ -1,7 +1,22 @@
+// Track D Step 4 — parallel queries + phase timings.
+// Same bidirectional search as Step 3 (proven: output hash matched twice).
+// Changes:
+//  - queries run across threads with an atomic work-stealing counter, so a
+//    hard query can't strand one thread while others idle. Results land in
+//    per-slot atomics, then write out in query order.
+//  - per-thread distance stores (sharing them across threads would be a
+//    data race; each thread's store is its own). Stamps are u16: query
+//    generations are <= 2000, and u16 stamps save 7 MB per store.
+//  - thread count: THREADS env if set, else machine parallelism, else 12.
+//  - phase timings on stderr: load vs queries, so the next step attacks
+//    whichever phase actually dominates.
+
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 const INF: u64 = u64::MAX;
 
@@ -166,11 +181,12 @@ fn load_queries(path: &str) -> Vec<(u32, u32)> {
 // ---------------------------------------------------------------- solver
 
 // Distance store with a per-query generation stamp, so a new query costs
-// O(1) instead of an O(n) refill. gen starts at 1; seen[] starts at 0.
+// O(1) instead of an O(n) refill. Stamps are u16: generations are query
+// indices + 1, at most 2000 here, far below the u16 limit.
 struct Dist {
     d: Vec<u64>,
-    seen: Vec<u32>,
-    cur: u32,
+    seen: Vec<u16>,
+    cur: u16,
 }
 
 impl Dist {
@@ -182,7 +198,7 @@ impl Dist {
         }
     }
 
-    fn start(&mut self, gen: u32) {
+    fn start(&mut self, gen: u16) {
         self.cur = gen;
     }
 
@@ -224,7 +240,7 @@ fn bidir(
     t: u32,
     df: &mut Dist,
     db: &mut Dist,
-    gen: u32,
+    gen: u16,
 ) -> i64 {
     if s == t {
         return 0;
@@ -298,41 +314,75 @@ fn bidir(
     }
 }
 
+fn thread_count() -> usize {
+    if let Ok(v) = std::env::var("THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(12)
+}
+
 fn main() {
+    let t0 = Instant::now();
     let (n, fwd, rev) = load_graph("/data/graph.txt");
     let queries = load_queries("/data/queries.txt");
     let (fo, fd, fw) = fwd;
     let (ro, rd, rw) = rev;
     let qcount = queries.len();
+    let t_load = t0.elapsed();
 
-    let mut df = Dist::new(n);
-    let mut db = Dist::new(n);
+    let nthreads = thread_count();
+    eprintln!("threads: {}", nthreads);
+    let results: Vec<AtomicI64> = (0..qcount).map(|_| AtomicI64::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    let t_q0 = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..nthreads {
+            scope.spawn(|| {
+                let mut df = Dist::new(n);
+                let mut db = Dist::new(n);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= qcount {
+                        break;
+                    }
+                    let (s, t) = queries[i];
+                    let d = if (s as usize) >= n || (t as usize) >= n {
+                        if s == t {
+                            0
+                        } else {
+                            -1
+                        }
+                    } else {
+                        bidir(
+                            &fo, &fd, &fw, &ro, &rd, &rw, s, t, &mut df, &mut db,
+                            (i + 1) as u16,
+                        )
+                    };
+                    results[i].store(d, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let t_q = t_q0.elapsed();
+
     let out = File::create("/out/distances.txt").expect("create output");
     let mut w = BufWriter::new(out);
-    for (i, (s, t)) in queries.iter().enumerate() {
-        let d = if (*s as usize) >= n || (*t as usize) >= n {
-            if s == t {
-                0
-            } else {
-                -1
-            }
-        } else {
-            bidir(
-                &fo,
-                &fd,
-                &fw,
-                &ro,
-                &rd,
-                &rw,
-                *s,
-                *t,
-                &mut df,
-                &mut db,
-                (i + 1) as u32,
-            )
-        };
-        writeln!(w, "{}", d).expect("write");
+    for r in &results {
+        writeln!(w, "{}", r.load(Ordering::Relaxed)).expect("write");
     }
     w.flush().expect("flush");
-    eprintln!("done: n={} queries={}", n, qcount);
+    eprintln!(
+        "done: n={} queries={} load={:?} queries={:?} total={:?}",
+        n,
+        qcount,
+        t_load,
+        t_q,
+        t0.elapsed()
+    );
 }
