@@ -1,36 +1,62 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
-
-#[derive(Default)]
-struct FxHasher {
-    hash: u64,
-}
+use std::sync::Mutex;
 
 const FX_SEED: u64 = 0x517cc1b727220a95;
 
-impl Hasher for FxHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.hash = (self.hash.rotate_left(5) ^ b as u64).wrapping_mul(FX_SEED);
-        }
+#[inline(always)]
+fn fx_word(h: u64, word: u64) -> u64 {
+    (h.rotate_left(37) ^ word).wrapping_mul(FX_SEED)
+}
+
+#[inline]
+fn fx_hash(b: &[u8]) -> u64 {
+    let mut h = 0u64;
+    let mut chunks = b.chunks_exact(8);
+    for c in &mut chunks {
+        h = fx_word(h, u64::from_le_bytes(c.try_into().unwrap()));
     }
+    let r = chunks.remainder();
+    if !r.is_empty() {
+        let mut tail = 0u64;
+        for (i, &bb) in r.iter().enumerate() {
+            tail |= (bb as u64) << (8 * i);
+        }
+        h = fx_word(h, tail);
+    }
+    h
+}
+
+struct FxHasher(u64);
+impl Default for FxHasher {
+    fn default() -> Self {
+        FxHasher(0)
+    }
+}
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = fx_hash(bytes);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = fx_word(self.0 ^ v, FX_SEED);
+    }
+    #[inline]
     fn finish(&self) -> u64 {
-        self.hash
+        self.0
     }
 }
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
-struct Group {
-    lats: Vec<u32>,
-    errors: u32,
-}
-
+#[inline(always)]
 fn hour_index(ts: &[u8]) -> u32 {
-    let day = (ts[8] - b'0') as u32 * 10 + (ts[9] - b'0') as u32;
-    let hour = (ts[11] - b'0') as u32 * 10 + (ts[12] - b'0') as u32;
+    let day = ((ts[8] - b'0') as u32) * 10 + (ts[9] - b'0') as u32;
+    let hour = ((ts[11] - b'0') as u32) * 10 + (ts[12] - b'0') as u32;
     match day {
         30 => hour - 18,
         31 => 6 + hour,
@@ -39,35 +65,31 @@ fn hour_index(ts: &[u8]) -> u32 {
     }
 }
 
-fn hour_string(idx: u32) -> String {
-    match idx {
-        0..=5 => format!("2026-10-30T{:02}:00:00Z", idx + 18),
-        6..=29 => format!("2026-10-31T{:02}:00:00Z", idx - 6),
-        30..=53 => format!("2026-11-01T{:02}:00:00Z", idx - 30),
-        _ => format!("2026-11-02T{:02}:00:00Z", idx - 54),
-    }
-}
-
-fn parse_u32(bytes: &[u8]) -> u32 {
-    let mut v: u32 = 0;
-    for &b in bytes {
-        v = v * 10 + (b - b'0') as u32;
+fn build_hour_table() -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(72);
+    for idx in 0..72u32 {
+        let s = match idx {
+            0..=5 => format!("2026-10-30T{:02}:00:00Z", idx + 18),
+            6..=29 => format!("2026-10-31T{:02}:00:00Z", idx - 6),
+            30..=53 => format!("2026-11-01T{:02}:00:00Z", idx - 30),
+            _ => format!("2026-11-02T{:02}:00:00Z", idx - 54),
+        };
+        v.push(s);
     }
     v
 }
 
-// SWAR search: 8 bytes at a time for `target`, scalar tail.
+#[inline(always)]
 fn find_byte(data: &[u8], mut i: usize, target: u8) -> Option<usize> {
     let rep = (target as u64) * 0x0101010101010101;
     while i + 8 <= data.len() {
-        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let x = chunk ^ rep;
+        let x = u64::from_le_bytes(data[i..i + 8].try_into().unwrap()) ^ rep;
         let found = x
             .wrapping_sub(0x0101010101010101)
             & !x
             & 0x8080808080808080;
         if found != 0 {
-            return Some(i + (found.trailing_zeros() / 8) as usize);
+            return Some(i + (found.trailing_zeros() >> 3) as usize);
         }
         i += 8;
     }
@@ -80,52 +102,248 @@ fn find_byte(data: &[u8], mut i: usize, target: u8) -> Option<usize> {
     None
 }
 
-fn process_line(
-    line: &[u8],
-    intern: &mut FxMap<Vec<u8>, u16>,
-    endpoints: &mut Vec<Vec<u8>>,
-    groups: &mut FxMap<u32, Group>,
-) {
-    let ts = &line[..27];
-    let method_end = find_byte(line, 28, b' ').expect("method end");
-    let endpoint_start = method_end + 1;
-    let endpoint_end = find_byte(line, endpoint_start, b' ').expect("endpoint end");
-    let endpoint = &line[endpoint_start..endpoint_end];
-    let status_start = endpoint_end + 1;
-    let status = line[status_start];
-    let latency = &line[status_start + 4..];
-    let eid = if let Some(&eid) = intern.get(endpoint) {
-        eid
-    } else {
-        let id = endpoints.len() as u16;
-        endpoints.push(endpoint.to_vec());
-        intern.insert(endpoint.to_vec(), id);
-        id
-    };
-    let key = hour_index(ts) * 2048 + eid as u32;
-    let g = groups.entry(key).or_insert_with(|| Group {
-        lats: Vec::new(),
-        errors: 0,
-    });
-    g.lats.push(parse_u32(latency));
-    if status == b'5' {
-        g.errors += 1;
+#[inline(always)]
+fn find_two_spaces(data: &[u8], mut i: usize) -> (usize, usize) {
+    const LOM: u64 = 0x0101010101010101;
+    const HIM: u64 = 0x8080808080808080;
+    let rep = 0x2020202020202020u64;
+    let mut first = usize::MAX;
+    while i + 8 <= data.len() {
+        let x = u64::from_le_bytes(data[i..i + 8].try_into().unwrap()) ^ rep;
+        let found = x.wrapping_sub(LOM) & !x & HIM;
+        if found != 0 {
+            let b = (found.trailing_zeros() >> 3) as usize;
+            if first == usize::MAX {
+                first = i + b;
+                let rest = if b == 7 {
+                    0
+                } else {
+                    found & !((1u64 << (8 * (b as u32 + 1))) - 1)
+                };
+                if rest != 0 {
+                    return (first, i + (rest.trailing_zeros() >> 3) as usize);
+                }
+            } else {
+                return (first, i + b);
+            }
+        }
+        i += 8;
+    }
+    while i < data.len() {
+        if data[i] == b' ' {
+            if first == usize::MAX {
+                first = i;
+            } else {
+                return (first, i);
+            }
+        }
+        i += 1;
+    }
+    unreachable!("grammar guarantees two spaces after ts")
+}
+
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    const E: u64 = 0x00FF00FF00FF00FF;
+    const H: u64 = 0x0000FFFF0000FFFF;
+    let pairs = (x & E).wrapping_mul(10) + ((x >> 8) & E);
+    let quads = pairs.wrapping_mul(100);
+    let quads_lo = (quads & H) + ((pairs >> 16) & H);
+    let v = quads_lo.wrapping_mul(10000);
+    let v = (v & 0xFFFF_FFFF) + (quads_lo >> 32);
+    v & 0xFFFF_FFFF
+}
+
+#[inline]
+fn parse_latency(b: &[u8]) -> u64 {
+    let n = b.len();
+    let mut v = 0u64;
+    let mut i = 0usize;
+    if n >= 8 {
+        let chunk = u64::from_le_bytes(b[..8].try_into().unwrap());
+        v = parse8(chunk.wrapping_sub(0x3030303030303030));
+        i = 8;
+    }
+    while i < n {
+        v = v * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    v
+}
+
+enum Lats {
+    Small([u32; 4], u8),
+    Big(Vec<u32>),
+}
+
+impl Lats {
+    fn new(lat: u32) -> Self {
+        Lats::Small([lat, 0, 0, 0], 1)
+    }
+    fn push(&mut self, lat: u32) {
+        match self {
+            Lats::Small(arr, n) => {
+                let nn = *n as usize;
+                if nn < 4 {
+                    arr[nn] = lat;
+                    *n += 1;
+                } else {
+                    let mut v = Vec::with_capacity(8);
+                    v.extend_from_slice(arr);
+                    v.push(lat);
+                    *self = Lats::Big(v);
+                }
+            }
+            Lats::Big(v) => v.push(lat),
+        }
+    }
+    fn len(&self) -> u64 {
+        match self {
+            Lats::Small(_, n) => *n as u64,
+            Lats::Big(v) => v.len() as u64,
+        }
+    }
+    fn into_vec(self) -> Vec<u32> {
+        match self {
+            Lats::Small(arr, n) => arr[..n as usize].to_vec(),
+            Lats::Big(v) => v,
+        }
     }
 }
 
-struct ThreadResult {
-    endpoints: Vec<Vec<u8>>,
-    groups: FxMap<u32, Group>,
+const SHARD_BITS: usize = 10; // 1024 shards
+const SHARD_MASK: usize = (1 << SHARD_BITS) - 1;
+const NO_NEXT: u32 = u32::MAX;
+
+struct Slot {
+    next: u32,
+    off: u32,
+    len: u32,
+    hour: u8,
+    errors: u32,
+    lats: Lats,
 }
 
-// Aggregate only lines whose start offset lies in [start, end).
-fn aggregate_range(path: &str, start: u64, end: u64) -> ThreadResult {
+struct ShardInner {
+    map: FxMap<u64, u32>,
+    slots: Vec<Slot>,
+    arena: Vec<u8>,
+}
+
+impl ShardInner {
+    fn new() -> Self {
+        ShardInner {
+            map: FxMap::default(),
+            slots: Vec::new(),
+            arena: Vec::new(),
+        }
+    }
+}
+
+type Shards = Vec<Mutex<ShardInner>>;
+
+fn new_shards() -> Shards {
+    (0..1 << SHARD_BITS)
+        .map(|_| Mutex::new(ShardInner::new()))
+        .collect()
+}
+
+#[inline]
+fn process_line(line: &[u8], shards: &Shards) {
+    let hour = hour_index(line);
+    let (m_end, e_end) = find_two_spaces(line, 28);
+    let ep = &line[m_end + 1..e_end];
+    let err5 = if line[e_end + 1] == b'5' { 1 } else { 0 };
+    let lat = parse_latency(&line[e_end + 5..]) as u32;
+
+    let h = fx_hash(ep);
+    let key = ((hour as u64) << 57) | (h & ((1 << 57) - 1));
+    // Mix the hour into the shard index: a hot endpoint's traffic then
+    // spreads across shards by hour instead of funneling into one lock.
+    let shard_idx = ((h ^ (hour as u64).wrapping_mul(0x9E3779B97F4A7C15)) as usize) & SHARD_MASK;
+    let shard = &shards[shard_idx];
+
+    let mut guard = shard.lock().expect("shard lock");
+    let inner = &mut *guard;
+    match inner.map.entry(key) {
+        Entry::Vacant(v) => {
+            let off = inner.arena.len() as u32;
+            inner.arena.extend_from_slice(ep);
+            inner.slots.push(Slot {
+                next: NO_NEXT,
+                off,
+                len: ep.len() as u32,
+                hour: hour as u8,
+                errors: err5,
+                lats: Lats::new(lat),
+            });
+            v.insert(inner.slots.len() as u32 - 1);
+        }
+        Entry::Occupied(mut o) => {
+            let mut sidx = *o.get();
+            loop {
+                // Read the chain link's fields, then drop the borrow
+                // before any push, so the borrow checker never sees a
+                // slot borrow live across a slots mutation.
+                let (next, matched) = {
+                    let s = &inner.slots[sidx as usize];
+                    let m = s.len as usize == ep.len()
+                        && inner.arena[s.off as usize..s.off as usize + s.len as usize] == ep[..];
+                    (s.next, m)
+                };
+                if matched {
+                    let s = &mut inner.slots[sidx as usize];
+                    s.lats.push(lat);
+                    s.errors += err5;
+                    return;
+                }
+                if next == NO_NEXT {
+                    let off = inner.arena.len() as u32;
+                    inner.arena.extend_from_slice(ep);
+                    let new_idx = inner.slots.len() as u32;
+                    inner.slots.push(Slot {
+                        next: *o.get(),
+                        off,
+                        len: ep.len() as u32,
+                        hour: hour as u8,
+                        errors: err5,
+                        lats: Lats::new(lat),
+                    });
+                    *o.get_mut() = new_idx;
+                    return;
+                }
+                sidx = next;
+            }
+        }
+    }
+}
+
+const CHUNK: usize = 1 << 20; // 1 MB read blocks
+
+#[inline]
+fn read_full(file: &mut File, chunk: &mut [u8], want: usize) -> usize {
+    let mut filled = 0usize;
+    while filled < want {
+        match file.read(&mut chunk[filled..want]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+    filled
+}
+
+/// Parse every complete line whose start offset lies in [start, end).
+/// Ranges come from equal byte splits; each thread aligns its start to
+/// the next line boundary (peeking at the byte before start), so no
+/// serial line-starts pass and no starts table are needed.
+fn aggregate_range(path: &str, start: u64, end: u64, shards: &Shards) {
     let mut file = File::open(path).expect("open input");
     let mut skip_first = false;
     if start > 0 {
-        // Peek at the byte before start: '\n' means start is already a
-        // line start; otherwise start is mid-line and the first line
-        // we see is a tail belonging to the previous thread.
+        // '\n' just before start means start is already a line start;
+        // otherwise start is mid-line and the first line we meet is a
+        // tail belonging to the previous thread.
         file.seek(SeekFrom::Start(start - 1)).expect("seek");
         let mut b = [0u8; 1];
         file.read_exact(&mut b).expect("peek");
@@ -133,14 +351,9 @@ fn aggregate_range(path: &str, start: u64, end: u64) -> ThreadResult {
         // Cursor is now exactly at `start`.
     }
 
-    let mut intern: FxMap<Vec<u8>, u16> = FxMap::default();
-    let mut endpoints: Vec<Vec<u8>> = Vec::new();
-    let mut groups: FxMap<u32, Group> = FxMap::default();
     let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; 1 << 20];
+    let mut chunk = vec![0u8; CHUNK];
     let mut pos = start;
-    let mut eof = false;
-
     'outer: loop {
         // Process every complete line currently buffered.
         let mut consumed = 0usize;
@@ -151,51 +364,70 @@ fn aggregate_range(path: &str, start: u64, end: u64) -> ThreadResult {
             }
             let line = &pending[consumed..consumed + nl];
             if !skip_first {
-                process_line(line, &mut intern, &mut endpoints, &mut groups);
+                process_line(line, shards);
             }
             skip_first = false;
             pos += (nl + 1) as u64;
             consumed += nl + 1;
         }
         pending.drain(..consumed);
-        if eof {
-            break;
-        }
-        // Fill the next 1 MB block (short reads looped until full or EOF).
-        let mut filled = 0usize;
-        while filled < chunk.len() {
-            match file.read(&mut chunk[filled..]) {
-                Ok(0) => {
-                    eof = true;
-                    break;
-                }
-                Ok(n) => filled += n,
-                Err(e) => panic!("read: {e}"),
-            }
-        }
+        let filled = read_full(&mut file, &mut chunk, CHUNK);
         if filled == 0 {
             // EOF with a final line lacking a trailing newline (the
             // spec file ends with one, so this is only a safety net).
             if !pending.is_empty() && pos < end && !skip_first {
                 let tail = pending.clone();
-                process_line(&tail, &mut intern, &mut endpoints, &mut groups);
+                process_line(&tail, shards);
             }
             break;
         }
         pending.extend_from_slice(&chunk[..filled]);
     }
-    ThreadResult { endpoints, groups }
+}
+
+struct KeyRow {
+    hour: u32,
+    shard: u16,
+    slot: u32,
+    off: u32,
+    len: u32,
+}
+
+fn push_int(buf: &mut Vec<u8>, mut v: u64) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
 }
 
 fn main() {
-    let path = "/data/requests.log";
-    let len = std::fs::metadata(path).expect("stat input").len();
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .min(12);
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string());
+    let path: &'static str = Box::leak(format!("{data_dir}/requests.log").into_boxed_str());
+    let out_path = format!("{out_dir}/summary.txt");
 
-    let mut bounds: Vec<(u64, u64)> = Vec::new();
+    let nthreads = std::env::var("THREADS")
+        .ok()
+        .and_then(|t| t.parse::<usize>().ok())
+        .filter(|&t| t >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(12)
+        });
+
+    let shards = new_shards();
+    let len = std::fs::metadata(path).expect("stat input").len();
+
+    let mut bounds: Vec<(u64, u64)> = Vec::with_capacity(nthreads);
     for i in 0..nthreads {
         let s = len * i as u64 / nthreads as u64;
         let e = if i == nthreads - 1 {
@@ -206,73 +438,85 @@ fn main() {
         bounds.push((s, e));
     }
 
-    let results: Vec<ThreadResult> = std::thread::scope(|s| {
-        let handles: Vec<_> = bounds
-            .iter()
-            .map(|&(a, b)| s.spawn(move || aggregate_range(path, a, b)))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    std::thread::scope(|s| {
+        let shards_ref = &shards;
+        for &(a, b) in &bounds {
+            s.spawn(move || aggregate_range(path, a, b, shards_ref));
+        }
     });
 
-    let mut intern: FxMap<Vec<u8>, u16> = FxMap::default();
-    let mut endpoints: Vec<Vec<u8>> = Vec::new();
-    let mut groups: FxMap<u32, Group> = FxMap::default();
-    for tr in &results {
-        let mut remap = vec![0u16; tr.endpoints.len()];
-        for (lid, ep) in tr.endpoints.iter().enumerate() {
-            remap[lid] = if let Some(&gid) = intern.get(ep.as_slice()) {
-                gid
-            } else {
-                let gid = endpoints.len() as u16;
-                endpoints.push(ep.clone());
-                intern.insert(ep.clone(), gid);
-                gid
-            };
-        }
-        for (key, g) in &tr.groups {
-            let gkey = (key / 2048) * 2048 + remap[(key % 2048) as usize] as u32;
-            let dest = groups.entry(gkey).or_insert_with(|| Group {
-                lats: Vec::new(),
-                errors: 0,
+    let mut inners: Vec<ShardInner> = shards
+        .into_iter()
+        .map(|m| m.into_inner().expect("shard inner"))
+        .collect();
+
+    let total_keys: usize = inners.iter().map(|i| i.slots.len()).sum();
+    let mut sort_arena: Vec<u8> = Vec::with_capacity(1 << 22);
+    let mut rows: Vec<KeyRow> = Vec::with_capacity(total_keys);
+    for (si, inner) in inners.iter().enumerate() {
+        for (k, slot) in inner.slots.iter().enumerate() {
+            rows.push(KeyRow {
+                hour: slot.hour as u32,
+                shard: si as u16,
+                slot: k as u32,
+                off: sort_arena.len() as u32,
+                len: slot.len,
             });
-            dest.lats.extend_from_slice(&g.lats);
-            dest.errors += g.errors;
+            sort_arena.extend_from_slice(
+                &inner.arena[slot.off as usize..slot.off as usize + slot.len as usize],
+            );
         }
     }
-
-    let mut keys: Vec<u32> = groups.keys().copied().collect();
-    keys.sort_unstable_by(|&a, &b| {
-        let (ha, ea) = (a / 2048, a % 2048);
-        let (hb, eb) = (b / 2048, b % 2048);
-        ha.cmp(&hb)
-            .then_with(|| endpoints[ea as usize].cmp(&endpoints[eb as usize]))
+    // Output order: hour ascending, then endpoint bytes ascending.
+    rows.sort_unstable_by(|a, b| {
+        a.hour
+            .cmp(&b.hour)
+            .then_with(|| {
+                sort_arena[a.off as usize..a.off as usize + a.len as usize]
+                    .cmp(&sort_arena[b.off as usize..b.off as usize + b.len as usize])
+            })
     });
 
-    let out = std::fs::File::create("/out/summary.txt").expect("create output");
-    let mut w = std::io::BufWriter::new(out);
-    for key in keys {
-        let (hidx, eid) = (key / 2048, key % 2048);
-        let g = groups.get_mut(&key).expect("group");
-        let n = g.lats.len() as u64;
+    let hour_table = build_hour_table();
+
+    let out = File::create(&out_path).expect("create output");
+    let mut w = std::io::BufWriter::with_capacity(1 << 16, out);
+    let mut buf: Vec<u8> = Vec::with_capacity(192);
+
+    for k in &rows {
+        let slot = &mut inners[k.shard as usize].slots[k.slot as usize];
+        let n = slot.lats.len() as u64;
+        let errors = slot.errors;
+        // Take the latencies out of the slot instead of copying them:
+        // the slot is never used again after this row is written.
+        let mut lat = std::mem::replace(&mut slot.lats, Lats::Small([0; 4], 0)).into_vec();
         let rank = |p: u64| -> usize { ((p * n + 99) / 100 - 1) as usize };
-        let p50 = *g.lats.select_nth_unstable(rank(50)).1;
-        let p95 = *g.lats.select_nth_unstable(rank(95)).1;
-        let p99 = *g.lats.select_nth_unstable(rank(99)).1;
-        let ppm = g.errors as u64 * 1_000_000 / n;
-        writeln!(
-            w,
-            "{} {} {} {} {} {} {} {}",
-            hour_string(hidx),
-            std::str::from_utf8(&endpoints[eid as usize]).expect("endpoint"),
-            n,
-            p50,
-            p95,
-            p99,
-            g.errors,
-            ppm
-        )
-        .expect("write");
+        let r99 = rank(99);
+        let p99 = *lat.select_nth_unstable(r99).1;
+        let r95 = rank(95).min(r99);
+        let p95 = if r95 == r99 {
+            p99
+        } else {
+            *lat[..r99].select_nth_unstable(r95).1
+        };
+        let r50 = rank(50).min(r95);
+        let p50 = if r50 == r95 {
+            p95
+        } else {
+            *lat[..r95].select_nth_unstable(r50).1
+        };
+        let ppm = errors as u64 * 1_000_000 / n;
+
+        buf.clear();
+        buf.extend_from_slice(hour_table[k.hour as usize].as_bytes());
+        buf.push(b' ');
+        buf.extend_from_slice(&sort_arena[k.off as usize..k.off as usize + k.len as usize]);
+        for v in [n, p50 as u64, p95 as u64, p99 as u64, errors as u64, ppm] {
+            buf.push(b' ');
+            push_int(&mut buf, v);
+        }
+        buf.push(b'\n');
+        w.write_all(&buf).expect("write");
     }
     w.flush().expect("flush");
 }
-
