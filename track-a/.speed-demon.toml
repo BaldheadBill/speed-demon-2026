@@ -1,4 +1,3 @@
-# Read by the board and the scoring harness.
 track = "a"
 team = "BaldheadBill"
 language = "Rust"
