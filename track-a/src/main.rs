@@ -203,6 +203,12 @@ impl Lats {
             Lats::Big(v) => v.len() as u64,
         }
     }
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Lats::Small(arr, n) => &arr[..*n as usize],
+            Lats::Big(v) => v.as_slice(),
+        }
+    }
     fn into_vec(self) -> Vec<u32> {
         match self {
             Lats::Small(arr, n) => arr[..n as usize].to_vec(),
@@ -214,6 +220,9 @@ impl Lats {
 const SHARD_BITS: usize = 10; // 1024 shards
 const SHARD_MASK: usize = (1 << SHARD_BITS) - 1;
 const NO_NEXT: u32 = u32::MAX;
+
+const HOT_BITS: usize = 10; // 1024 hot-cache slots per thread
+const HOT_MASK: usize = (1 << HOT_BITS) - 1;
 
 struct Slot {
     next: u32,
@@ -248,18 +257,32 @@ fn new_shards() -> Shards {
         .collect()
 }
 
-#[inline]
-fn process_line(line: &[u8], shards: &Shards) {
-    let hour = hour_index(line);
-    let (m_end, e_end) = find_two_spaces(line, 28);
-    let ep = &line[m_end + 1..e_end];
-    let err5 = if line[e_end + 1] == b'5' { 1 } else { 0 };
-    let lat = parse_latency(&line[e_end + 5..]) as u32;
+struct HotSlot {
+    hour: u8,
+    occupied: bool,
+    errors: u32,
+    ep: Vec<u8>,
+    lats: Lats,
+}
 
+impl HotSlot {
+    fn empty() -> Self {
+        HotSlot {
+            hour: 0,
+            occupied: false,
+            errors: 0,
+            ep: Vec::new(),
+            lats: Lats::Small([0; 4], 0),
+        }
+    }
+}
+
+/// Append one whole cached group to the global table under a single
+/// lock acquisition. Used for cache evictions and the end-of-thread
+/// flush, never on the per-line path.
+fn insert_group(shards: &Shards, hour: u32, ep: &[u8], lats: Lats, errors: u32) {
     let h = fx_hash(ep);
     let key = ((hour as u64) << 57) | (h & ((1 << 57) - 1));
-    // Mix the hour into the shard index: a hot endpoint's traffic then
-    // spreads across shards by hour instead of funneling into one lock.
     let shard_idx = ((h ^ (hour as u64).wrapping_mul(0x9E3779B97F4A7C15)) as usize) & SHARD_MASK;
     let shard = &shards[shard_idx];
 
@@ -274,17 +297,14 @@ fn process_line(line: &[u8], shards: &Shards) {
                 off,
                 len: ep.len() as u32,
                 hour: hour as u8,
-                errors: err5,
-                lats: Lats::new(lat),
+                errors,
+                lats,
             });
             v.insert(inner.slots.len() as u32 - 1);
         }
         Entry::Occupied(mut o) => {
             let mut sidx = *o.get();
             loop {
-                // Read the chain link's fields, then drop the borrow
-                // before any push, so the borrow checker never sees a
-                // slot borrow live across a slots mutation.
                 let (next, matched) = {
                     let s = &inner.slots[sidx as usize];
                     let m = s.len as usize == ep.len()
@@ -293,8 +313,10 @@ fn process_line(line: &[u8], shards: &Shards) {
                 };
                 if matched {
                     let s = &mut inner.slots[sidx as usize];
-                    s.lats.push(lat);
-                    s.errors += err5;
+                    for &lat in lats.as_slice() {
+                        s.lats.push(lat);
+                    }
+                    s.errors += errors;
                     return;
                 }
                 if next == NO_NEXT {
@@ -306,8 +328,8 @@ fn process_line(line: &[u8], shards: &Shards) {
                         off,
                         len: ep.len() as u32,
                         hour: hour as u8,
-                        errors: err5,
-                        lats: Lats::new(lat),
+                        errors,
+                        lats,
                     });
                     *o.get_mut() = new_idx;
                     return;
@@ -316,6 +338,51 @@ fn process_line(line: &[u8], shards: &Shards) {
             }
         }
     }
+}
+
+/// Feed one line through the thread's hot cache. Hits never touch a
+/// lock or the global table; misses flush the evicted slot (batched)
+/// and cache the new line.
+fn feed_line(line: &[u8], hot: &mut [HotSlot], shards: &Shards) {
+    let hour = hour_index(line);
+    let (m_end, e_end) = find_two_spaces(line, 28);
+    let ep = &line[m_end + 1..e_end];
+    let err5 = if line[e_end + 1] == b'5' { 1 } else { 0 };
+    let lat = parse_latency(&line[e_end + 5..]) as u32;
+
+    let h = fx_hash(ep);
+    // Cache slot uses different hash bits than the shard index so the
+    // two mappings do not systematically coincide.
+    let cslot = (((h ^ (hour as u64).wrapping_mul(0x9E3779B97F4A7C15)) >> 10) as usize) & HOT_MASK;
+
+    let hit = {
+        let slot = &hot[cslot];
+        slot.occupied && slot.hour == hour as u8 && slot.ep.as_slice() == ep
+    };
+    if hit {
+        let slot = &mut hot[cslot];
+        slot.lats.push(lat);
+        slot.errors += err5;
+        return;
+    }
+    // Miss: flush the evicted occupant, then cache this line.
+    let old = std::mem::replace(&mut hot[cslot], HotSlot::empty());
+    let HotSlot {
+        hour: old_hour,
+        occupied,
+        errors: old_errors,
+        ep: old_ep,
+        lats: old_lats,
+    } = old;
+    if occupied {
+        insert_group(shards, old_hour as u32, &old_ep, old_lats, old_errors);
+    }
+    let slot = &mut hot[cslot];
+    slot.hour = hour as u8;
+    slot.occupied = true;
+    slot.errors = err5;
+    slot.ep.extend_from_slice(ep);
+    slot.lats = Lats::new(lat);
 }
 
 const CHUNK: usize = 1 << 20; // 1 MB read blocks
@@ -334,28 +401,21 @@ fn read_full(file: &mut File, chunk: &mut [u8], want: usize) -> usize {
 }
 
 /// Parse every complete line whose start offset lies in [start, end).
-/// Ranges come from equal byte splits; each thread aligns its start to
-/// the next line boundary (peeking at the byte before start), so no
-/// serial line-starts pass and no starts table are needed.
 fn aggregate_range(path: &str, start: u64, end: u64, shards: &Shards) {
     let mut file = File::open(path).expect("open input");
     let mut skip_first = false;
     if start > 0 {
-        // '\n' just before start means start is already a line start;
-        // otherwise start is mid-line and the first line we meet is a
-        // tail belonging to the previous thread.
         file.seek(SeekFrom::Start(start - 1)).expect("seek");
         let mut b = [0u8; 1];
         file.read_exact(&mut b).expect("peek");
         skip_first = b[0] != b'\n';
-        // Cursor is now exactly at `start`.
     }
 
+    let mut hot: Vec<HotSlot> = (0..1 << HOT_BITS).map(|_| HotSlot::empty()).collect();
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; CHUNK];
     let mut pos = start;
     'outer: loop {
-        // Process every complete line currently buffered.
         let mut consumed = 0usize;
         while let Some(nl) = find_byte(&pending[consumed..], 0, b'\n') {
             let line_start = pos;
@@ -364,7 +424,7 @@ fn aggregate_range(path: &str, start: u64, end: u64, shards: &Shards) {
             }
             let line = &pending[consumed..consumed + nl];
             if !skip_first {
-                process_line(line, shards);
+                feed_line(line, &mut hot, shards);
             }
             skip_first = false;
             pos += (nl + 1) as u64;
@@ -373,15 +433,26 @@ fn aggregate_range(path: &str, start: u64, end: u64, shards: &Shards) {
         pending.drain(..consumed);
         let filled = read_full(&mut file, &mut chunk, CHUNK);
         if filled == 0 {
-            // EOF with a final line lacking a trailing newline (the
-            // spec file ends with one, so this is only a safety net).
             if !pending.is_empty() && pos < end && !skip_first {
                 let tail = pending.clone();
-                process_line(&tail, shards);
+                feed_line(&tail, &mut hot, shards);
             }
             break;
         }
         pending.extend_from_slice(&chunk[..filled]);
+    }
+    // End of thread: flush every cached group to the global table.
+    for slot in hot {
+        let HotSlot {
+            hour,
+            occupied,
+            errors,
+            ep,
+            lats,
+        } = slot;
+        if occupied {
+            insert_group(shards, hour as u32, &ep, lats, errors);
+        }
     }
 }
 
