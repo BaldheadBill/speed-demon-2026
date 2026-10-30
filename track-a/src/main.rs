@@ -55,6 +55,24 @@ fn parse_u32(bytes: &[u8]) -> u32 {
     }
     v
 }
+fn find_space(data: &[u8], mut i: usize) -> usize {
+    while i + 8 <= data.len() {
+        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let x = chunk ^ 0x2020202020202020;
+        let found = x
+            .wrapping_sub(0x0101010101010101)
+            & !x
+            & 0x8080808080808080;
+        if found != 0 {
+            return i + (found.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < data.len() && data[i] != b' ' {
+        i += 1;
+    }
+    i
+}
 
 struct ThreadResult {
     endpoints: Vec<Vec<u8>>,
@@ -100,11 +118,14 @@ fn aggregate_range(path: &str, start: u64, end: u64) -> ThreadResult {
             &buf[..]
         };
         let mut parts = line.split(|&b| b == b' ');
-        let ts = parts.next().expect("ts");
-        let _method = parts.next().expect("method");
-        let endpoint = parts.next().expect("endpoint");
-        let status = parts.next().expect("status");
-        let latency = parts.next().expect("latency");
+        let ts = &line[..27];
+        let method_end = find_space(line, 28);
+        let endpoint_start = method_end + 1;
+        let endpoint_end = find_space(line, endpoint_start);
+		let endpoint = &line[endpoint_start..endpoint_end];
+		let status_start = endpoint_end + 1;
+		let status = &line[status_start..status_start + 3];
+        let latency = &line[status_start + 4..];
         let eid = if let Some(&eid) = intern.get(endpoint) {
             eid
         } else {
