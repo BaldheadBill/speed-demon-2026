@@ -1,7 +1,16 @@
-// Track B solver v1 — single-threaded, from the Oct 28 design sketch.
-// Pipeline: parse queries first -> scan docs once, posting lists for
-// WANTED terms only -> BOOL left-to-right merges -> phrase anchor +
-// grouped second scan -> results in query order.
+// Track B solver v2 — from v1 (hash-verified on full-seed1) plus:
+//  - query terms lowercased at intern time (docs are lowercased; v1
+//    assumed query terms already lowercase — now it holds either way)
+//  - parse_queries returns the wanted map (v1 rebuilt it in main)
+//  - doc scan parallel across line-aligned ranges, per-thread postings
+//    merged in thread order (sortedness preserved); per-thread
+//    timestamp dedup replaces the linear per-doc contains
+//  - BOOL queries chunked across threads (disjoint result slots)
+//  - phrase second scan parallel across the same ranges, per-thread
+//    matches merged in thread order
+//  - THREADS env (cap 12) or available parallelism
+// Unchanged from v1: tokenizer, query grammar, merge functions,
+// phrase anchor/grouping logic, output format, monotonic sort fallbacks.
 // Correctness load-bearers (all from the frozen spec):
 //  - byte tokenizer: tokens are maximal [a-z0-9] runs; every other byte
 //    (including >= 0x80) is a separator. Docs buffer is lowercased in
@@ -10,19 +19,15 @@
 //  - PHRASE = consecutive token positions (window check), not
 //    co-occurrence; repeated terms need repeated consecutive tokens.
 //  - Output: "<count> <sum> <up to 10 smallest ids>" or "0 0".
-//  - No positions stored, no raw texts stored (v1 simplicity; the second
-//    scan re-tokenizes from the in-memory docs buffer).
-// Deviations from the design sketch, both deliberate:
-//  - Per-doc dedup uses wanted-first lookup + a small per-doc vec instead
-//    of sorting each doc's tokens (fewer comparisons: only wanted tokens
-//    ever enter the dedup set).
-//  - If doc ids ever arrive non-monotonic (spec says they won't), posting
-//    lists and phrase match lists are sorted after the fact rather than
-//    trusting scan order.
+//  - No positions stored, no raw texts stored (the second scan
+//    re-tokenizes from the in-memory docs buffer).
 // Format correction found on the first run (Oct 30, 2026): queries.txt
 // lines carry a type prefix, "BOOL " or "PHRASE ", before the expression.
 // The parser strips it (space or tab separator); a bare expression with
 // no prefix still parses via the fallback below.
+// Deliberately kept from v1 (review decision): the optional count-header
+// check stays until the spec confirms queries.txt never carries one —
+// deleting it saves 13 lines but risks eating a real first query.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -139,9 +144,35 @@ enum Query {
 struct ParsedQueries {
     queries: Vec<Query>,
     wanted_terms: Vec<Box<[u8]>>,
+    wanted: FxMap<Box<[u8]>, u32>,
     n_bool: usize,
     n_phrase: usize,
     n_dup: usize,
+}
+
+// Intern a query term: lowercase first, since docs are lowercased before
+// the scan and terms must be lowercase to match. The fast path skips the
+// copy when the token is already lowercase.
+fn intern_term(
+    tok: &[u8],
+    wanted: &mut FxMap<Box<[u8]>, u32>,
+    wanted_terms: &mut Vec<Box<[u8]>>,
+) -> u32 {
+    let owned: Box<[u8]> = if tok.iter().any(|&b| b.is_ascii_uppercase()) {
+        tok.iter()
+            .map(|&b| b.to_ascii_lowercase())
+            .collect::<Vec<u8>>()
+            .into_boxed_slice()
+    } else {
+        tok.into()
+    };
+    if let Some(&i) = wanted.get(&*owned) {
+        return i;
+    }
+    let i = wanted_terms.len() as u32;
+    wanted.insert(owned.clone(), i);
+    wanted_terms.push(owned);
+    i
 }
 
 fn parse_queries(buf: &[u8]) -> ParsedQueries {
@@ -174,19 +205,6 @@ fn parse_queries(buf: &[u8]) -> ParsedQueries {
 
     let mut wanted: FxMap<Box<[u8]>, u32> = FxMap::default();
     let mut wanted_terms: Vec<Box<[u8]>> = Vec::new();
-    let mut term_idx = |tok: &[u8],
-                        wanted: &mut FxMap<Box<[u8]>, u32>,
-                        wanted_terms: &mut Vec<Box<[u8]>>|
-     -> u32 {
-        if let Some(&i) = wanted.get(tok) {
-            return i;
-        }
-        let i = wanted_terms.len() as u32;
-        wanted.insert(tok.into(), i);
-        wanted_terms.push(tok.into());
-        i
-    };
-
     let mut dup_map: FxMap<Vec<u8>, usize> = FxMap::default();
     let mut queries: Vec<Query> = Vec::new();
     let mut n_bool = 0;
@@ -227,7 +245,7 @@ fn parse_queries(buf: &[u8]) -> ParsedQueries {
             let mut terms = Vec::new();
             for tok in inner.split(|&c| c == b' ' || c == b'\t') {
                 if !tok.is_empty() {
-                    terms.push(term_idx(tok, &mut wanted, &mut wanted_terms));
+                    terms.push(intern_term(tok, &mut wanted, &mut wanted_terms));
                 }
             }
             queries.push(Query::Phrase { terms });
@@ -248,7 +266,7 @@ fn parse_queries(buf: &[u8]) -> ParsedQueries {
                     String::from_utf8_lossy(line)
                 );
             }
-            let mut terms = vec![term_idx(toks[0], &mut wanted, &mut wanted_terms)];
+            let mut terms = vec![intern_term(toks[0], &mut wanted, &mut wanted_terms)];
             let mut ops = Vec::new();
             let mut i = 1;
             while i < toks.len() {
@@ -274,7 +292,7 @@ fn parse_queries(buf: &[u8]) -> ParsedQueries {
                     );
                 }
                 ops.push(op);
-                terms.push(term_idx(toks[i + 1], &mut wanted, &mut wanted_terms));
+                terms.push(intern_term(toks[i + 1], &mut wanted, &mut wanted_terms));
                 i += 2;
             }
             queries.push(Query::Bool { terms, ops });
@@ -285,6 +303,7 @@ fn parse_queries(buf: &[u8]) -> ParsedQueries {
     ParsedQueries {
         queries,
         wanted_terms,
+        wanted,
         n_bool,
         n_phrase,
         n_dup,
@@ -393,58 +412,73 @@ fn format_result(ids: &[u32]) -> String {
     s
 }
 
-// ---------------------------------------------------------------- main
+// ---------------------------------------------------------------- parallel scan
 
-struct PhraseData {
-    query_idx: usize,
-    terms: Vec<u32>,
+// Line-aligned byte ranges for T threads: thread i owns lines starting in
+// [start_i, end_i), where end_i is thread i+1's unaligned split and
+// start_i is aligned forward to the next line start. No gap, no overlap:
+// the aligned start of i+1 is the first line start >= end_i, so every line
+// start falls in exactly one range.
+fn align_ranges(buf: &[u8], nthreads: usize) -> Vec<(usize, usize)> {
+    let len = buf.len();
+    let mut ranges = Vec::with_capacity(nthreads);
+    for i in 0..nthreads {
+        let end = if i + 1 == nthreads {
+            len
+        } else {
+            (i + 1) * len / nthreads
+        };
+        let mut start = i * len / nthreads;
+        if start > 0 {
+            while start < len && buf[start - 1] != b'\n' {
+                start += 1;
+            }
+        }
+        ranges.push((start, end));
+    }
+    ranges
 }
 
-fn main() {
-    let t0 = Instant::now();
+struct ScanOut {
+    postings: Vec<Vec<u32>>,
+    n_docs: usize,
+    skipped: usize,
+    max_id: Option<u32>,
+    first_id: Option<u32>,
+    last_id: Option<u32>,
+    monotonic: bool,
+}
 
-    // ---- parse queries first (wanted terms come from here) ----
-    let qbuf = read_file("/data/queries.txt");
-    let parsed = parse_queries(&qbuf);
-    let t_parse = t0.elapsed();
-    let n_queries = parsed.queries.len();
-    eprintln!(
-        "queries: total={} bool={} phrase={} dup={} wanted_terms={}",
-        n_queries,
-        parsed.n_bool,
-        parsed.n_phrase,
-        parsed.n_dup,
-        parsed.wanted_terms.len()
-    );
-
-    // Wanted lookup table: term bytes -> posting index.
-    let mut wanted: FxMap<Box<[u8]>, u32> = FxMap::default();
-    for (i, t) in parsed.wanted_terms.iter().enumerate() {
-        wanted.insert(t.clone(), i as u32);
-    }
-    let mut postings: Vec<Vec<u32>> = vec![Vec::new(); parsed.wanted_terms.len()];
-
-    // ---- scan docs once ----
-    let mut dbuf = read_file("/data/docs.txt");
-    // Lowercase in place: A-Z -> a-z. Token boundaries are unchanged
-    // (both cases are token bytes), so slices compare directly.
-    for b in dbuf.iter_mut() {
-        if b.is_ascii_uppercase() {
-            *b |= 0x20;
-        }
-    }
-    let mut n_docs = 0usize;
-    let mut max_id = 0u32;
+// Scan one range: same per-line logic as v1's single pass, but dedup via
+// a timestamp array (seen[term] == current doc mark) instead of a linear
+// per-doc contains scan. Lists come out ascending iff the range's ids do.
+fn scan_range(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    wanted: &FxMap<Box<[u8]>, u32>,
+    n_wanted: usize,
+) -> ScanOut {
+    let mut postings: Vec<Vec<u32>> = vec![Vec::new(); n_wanted];
+    let mut seen: Vec<u32> = vec![0; n_wanted];
+    let mut mark: u32 = 0;
+    let mut n_docs = 0;
+    let mut skipped = 0;
+    let mut max_id: Option<u32> = None;
+    let mut first_id: Option<u32> = None;
+    let mut last_id: Option<u32> = None;
     let mut prev_id: Option<u32> = None;
     let mut monotonic = true;
-    let mut skipped_no_tab = 0usize;
-    let mut doc_terms: Vec<u32> = Vec::new();
-    let mut pos = 0;
-    while let Some(line) = next_line(&dbuf, &mut pos) {
+    let mut pos = start;
+    while pos < end {
+        let line = match next_line(buf, &mut pos) {
+            Some(l) => l,
+            None => break,
+        };
         let tab = match line.iter().position(|&c| c == b'\t') {
             Some(t) => t,
             None => {
-                skipped_no_tab += 1;
+                skipped += 1;
                 continue;
             }
         };
@@ -457,138 +491,62 @@ fn main() {
             }
         }
         prev_id = Some(id);
-        if id > max_id {
-            max_id = id;
+        if first_id.is_none() {
+            first_id = Some(id);
         }
+        last_id = Some(id);
+        max_id = Some(match max_id {
+            Some(m) => m.max(id),
+            None => id,
+        });
         n_docs += 1;
+        mark += 1;
         let text = &line[tab + 1..];
-        doc_terms.clear();
         let mut tpos = 0;
         while let Some(tok) = next_token(text, &mut tpos) {
             if let Some(&ti) = wanted.get(tok) {
-                if !doc_terms.contains(&ti) {
-                    doc_terms.push(ti);
-                }
-            }
-        }
-        for &ti in &doc_terms {
-            postings[ti as usize].push(id);
-        }
-    }
-    if !monotonic {
-        // Spec says ids arrive ascending; if they ever don't, sort the
-        // lists rather than trusting scan order.
-        for list in postings.iter_mut() {
-            list.sort_unstable();
-        }
-    }
-    let n_doc_ids = max_id as usize + 1;
-    let posting_total: usize = postings.iter().map(|l| l.len()).sum();
-    let t_scan = t0.elapsed();
-    eprintln!(
-        "docs: lines={} max_id={} skipped_no_tab={} monotonic={} postings_total={}",
-        n_docs, max_id, skipped_no_tab, monotonic, posting_total
-    );
-
-    let mut results: Vec<String> = vec![String::new(); n_queries];
-
-    // ---- BOOL queries ----
-    let mut buf_a: Vec<u32> = Vec::new();
-    let mut buf_b: Vec<u32> = Vec::new();
-    for (qi, q) in parsed.queries.iter().enumerate() {
-        if let Query::Bool { terms, ops } = q {
-            if ops.is_empty() {
-                // Single term: use the posting list directly, no copy.
-                results[qi] = format_result(&postings[terms[0] as usize]);
-            } else {
-                buf_a.clear();
-                buf_a.extend_from_slice(&postings[terms[0] as usize]);
-                let mut cur_is_a = true;
-                for (k, op) in ops.iter().enumerate() {
-                    let list = &postings[terms[k + 1] as usize];
-                    if cur_is_a {
-                        match op {
-                            Op::And => intersect(&buf_a, list, &mut buf_b),
-                            Op::Or => union_merge(&buf_a, list, &mut buf_b),
-                            Op::Not => subtract(&buf_a, list, &mut buf_b),
-                        }
-                    } else {
-                        match op {
-                            Op::And => intersect(&buf_b, list, &mut buf_a),
-                            Op::Or => union_merge(&buf_b, list, &mut buf_a),
-                            Op::Not => subtract(&buf_b, list, &mut buf_a),
-                        }
-                    }
-                    cur_is_a = !cur_is_a;
-                }
-                let res = if cur_is_a { &buf_a } else { &buf_b };
-                results[qi] = format_result(res);
-            }
-        }
-    }
-    let t_bool = t0.elapsed();
-
-    // ---- PHRASE queries: anchor + grouped second scan ----
-    let anchor_thresh = n_doc_ids / 1000;
-    let mut phrases: Vec<PhraseData> = Vec::new();
-    let mut phrase_matches: Vec<Vec<u32>> = Vec::new();
-    let mut phrases_by_doc: Vec<Vec<u32>> = vec![Vec::new(); n_doc_ids];
-    for (qi, q) in parsed.queries.iter().enumerate() {
-        if let Query::Phrase { terms } = q {
-            if terms.is_empty() {
-                results[qi] = "0 0".to_string();
-                continue;
-            }
-            // Absent term -> no match, no grouping.
-            if terms.iter().any(|&t| postings[t as usize].is_empty()) {
-                results[qi] = "0 0".to_string();
-                continue;
-            }
-            let (mut min_t, mut min_len) = (terms[0], postings[terms[0] as usize].len());
-            for &t in &terms[1..] {
-                let l = postings[t as usize].len();
-                if l < min_len {
-                    min_t = t;
-                    min_len = l;
-                }
-            }
-            let ppos = phrases.len();
-            phrases.push(PhraseData {
-                query_idx: qi,
-                terms: terms.clone(),
-            });
-            phrase_matches.push(Vec::new());
-            if min_len <= anchor_thresh {
-                // Anchor path: candidates = anchor posting list.
-                for &doc in &postings[min_t as usize] {
-                    phrases_by_doc[doc as usize].push(ppos as u32);
-                }
-            } else {
-                // No anchor: intersect all phrase terms' lists first.
-                let mut cand = postings[min_t as usize].clone();
-                let mut tmp: Vec<u32> = Vec::new();
-                for &t in terms {
-                    if t == min_t {
-                        continue;
-                    }
-                    intersect(&cand, &postings[t as usize], &mut tmp);
-                    std::mem::swap(&mut cand, &mut tmp);
-                    if cand.is_empty() {
-                        break;
-                    }
-                }
-                for doc in cand {
-                    phrases_by_doc[doc as usize].push(ppos as u32);
+                if seen[ti as usize] != mark {
+                    seen[ti as usize] = mark;
+                    postings[ti as usize].push(id);
                 }
             }
         }
     }
+    ScanOut {
+        postings,
+        n_docs,
+        skipped,
+        max_id,
+        first_id,
+        last_id,
+        monotonic,
+    }
+}
 
-    // Second scan in doc order; matches append ascending (unless the
-    // file was non-monotonic, in which case sort at the end).
-    let mut pos2 = 0;
+struct PhraseData {
+    query_idx: usize,
+    terms: Vec<u32>,
+}
+
+// Second scan for one range: same window check as v1, but matches land in
+// per-thread lists that the caller merges in thread order (ascending iff
+// the range's ids are, same argument as the postings merge).
+fn phrase_range(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    phrases: &[PhraseData],
+    phrases_by_doc: &[Vec<u32>],
+    wanted_terms: &[Box<[u8]>],
+) -> Vec<Vec<u32>> {
+    let mut matches: Vec<Vec<u32>> = vec![Vec::new(); phrases.len()];
     let mut tokens: Vec<&[u8]> = Vec::new();
-    while let Some(line) = next_line(&dbuf, &mut pos2) {
+    let mut pos = start;
+    while pos < end {
+        let line = match next_line(buf, &mut pos) {
+            Some(l) => l,
+            None => break,
+        };
         let tab = match line.iter().position(|&c| c == b'\t') {
             Some(t) => t,
             None => continue,
@@ -617,8 +575,7 @@ fn main() {
             for start in 0..=(tokens.len() - plen) {
                 let mut ok = true;
                 for j in 0..plen {
-                    if tokens[start + j] != parsed.wanted_terms[ph.terms[j] as usize].as_ref()
-                    {
+                    if tokens[start + j] != wanted_terms[ph.terms[j] as usize].as_ref() {
                         ok = false;
                         break;
                     }
@@ -629,8 +586,249 @@ fn main() {
                 }
             }
             if found {
-                phrase_matches[ppos as usize].push(id);
+                matches[ppos as usize].push(id);
             }
+        }
+    }
+    matches
+}
+
+// ---------------------------------------------------------------- main
+
+fn main() {
+    let t0 = Instant::now();
+    let nthreads = std::env::var("THREADS")
+        .ok()
+        .and_then(|t| t.parse::<usize>().ok())
+        .filter(|&t| t >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(12)
+        });
+
+    // ---- parse queries first (wanted terms come from here) ----
+    let qbuf = read_file("/data/queries.txt");
+    let parsed = parse_queries(&qbuf);
+    let t_parse = t0.elapsed();
+    let n_queries = parsed.queries.len();
+    let n_wanted = parsed.wanted_terms.len();
+    eprintln!(
+        "queries: total={} bool={} phrase={} dup={} wanted_terms={} threads={}",
+        n_queries,
+        parsed.n_bool,
+        parsed.n_phrase,
+        parsed.n_dup,
+        n_wanted,
+        nthreads
+    );
+
+    // ---- scan docs once, in parallel ----
+    let mut dbuf = read_file("/data/docs.txt");
+    // Lowercase in place: A-Z -> a-z. Token boundaries are unchanged
+    // (both cases are token bytes), so slices compare directly.
+    for b in dbuf.iter_mut() {
+        if b.is_ascii_uppercase() {
+            *b |= 0x20;
+        }
+    }
+    let ranges = align_ranges(&dbuf, nthreads);
+    // Shared references are Copy, so each spawn closure can move its own.
+    let dbuf_ref: &[u8] = &dbuf;
+    let wanted_ref = &parsed.wanted;
+    let outs: Vec<ScanOut> = std::thread::scope(|s| {
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                s.spawn(move || scan_range(dbuf_ref, start, end, wanted_ref, n_wanted))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("scan thread"))
+            .collect()
+    });
+    // Merge in thread order: ranges are consecutive file segments, so
+    // merged lists stay ascending iff the file's ids do (v1's argument).
+    let mut postings: Vec<Vec<u32>> = vec![Vec::new(); n_wanted];
+    let mut n_docs = 0usize;
+    let mut skipped_no_tab = 0usize;
+    let mut max_id = 0u32;
+    let mut monotonic = true;
+    let mut prev_last: Option<u32> = None;
+    for out in outs {
+        n_docs += out.n_docs;
+        skipped_no_tab += out.skipped;
+        if let Some(m) = out.max_id {
+            if m > max_id {
+                max_id = m;
+            }
+        }
+        if !out.monotonic {
+            monotonic = false;
+        }
+        if let (Some(first), Some(last)) = (out.first_id, out.last_id) {
+            if let Some(pl) = prev_last {
+                if first < pl {
+                    monotonic = false;
+                }
+            }
+            prev_last = Some(last);
+        }
+        for (ti, list) in out.postings.into_iter().enumerate() {
+            postings[ti].extend(list);
+        }
+    }
+    if !monotonic {
+        // Spec says ids arrive ascending; if they ever don't, sort the
+        // lists rather than trusting scan order.
+        for list in postings.iter_mut() {
+            list.sort_unstable();
+        }
+    }
+    let n_doc_ids = max_id as usize + 1;
+    let posting_total: usize = postings.iter().map(|l| l.len()).sum();
+    let t_scan = t0.elapsed();
+    eprintln!(
+        "docs: lines={} max_id={} skipped_no_tab={} monotonic={} postings_total={}",
+        n_docs, max_id, skipped_no_tab, monotonic, posting_total
+    );
+
+    let mut results: Vec<String> = vec![String::new(); n_queries];
+
+    // ---- BOOL queries, chunked across threads (disjoint slots) ----
+    if n_queries > 0 {
+        let qchunk = (n_queries + nthreads - 1) / nthreads;
+        let chunks: Vec<&mut [String]> = results.chunks_mut(qchunk).collect();
+        let queries_ref = &parsed.queries;
+        let postings_ref = &postings;
+        std::thread::scope(|s| {
+            for (ci, chunk) in chunks.into_iter().enumerate() {
+                let chunk_start = ci * qchunk;
+                s.spawn(move || {
+                    let mut buf_a: Vec<u32> = Vec::new();
+                    let mut buf_b: Vec<u32> = Vec::new();
+                    for (slot, q) in chunk.iter_mut().zip(queries_ref[chunk_start..].iter())
+                    {
+                        if let Query::Bool { terms, ops } = q {
+                            if ops.is_empty() {
+                                // Single term: use the posting list directly, no copy.
+                                *slot = format_result(&postings_ref[terms[0] as usize]);
+                            } else {
+                                buf_a.clear();
+                                buf_a.extend_from_slice(&postings_ref[terms[0] as usize]);
+                                let mut cur_is_a = true;
+                                for (k, op) in ops.iter().enumerate() {
+                                    let list = &postings_ref[terms[k + 1] as usize];
+                                    if cur_is_a {
+                                        match op {
+                                            Op::And => intersect(&buf_a, list, &mut buf_b),
+                                            Op::Or => union_merge(&buf_a, list, &mut buf_b),
+                                            Op::Not => subtract(&buf_a, list, &mut buf_b),
+                                        }
+                                    } else {
+                                        match op {
+                                            Op::And => intersect(&buf_b, list, &mut buf_a),
+                                            Op::Or => union_merge(&buf_b, list, &mut buf_a),
+                                            Op::Not => subtract(&buf_b, list, &mut buf_a),
+                                        }
+                                    }
+                                    cur_is_a = !cur_is_a;
+                                }
+                                let res = if cur_is_a { &buf_a } else { &buf_b };
+                                *slot = format_result(res);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let t_bool = t0.elapsed();
+
+    // ---- PHRASE queries: anchor + grouped second scan ----
+    let anchor_thresh = n_doc_ids / 1000;
+    let mut phrases: Vec<PhraseData> = Vec::new();
+    let mut phrases_by_doc: Vec<Vec<u32>> = vec![Vec::new(); n_doc_ids];
+    for (qi, q) in parsed.queries.iter().enumerate() {
+        if let Query::Phrase { terms } = q {
+            if terms.is_empty() {
+                results[qi] = "0 0".to_string();
+                continue;
+            }
+            // Absent term -> no match, no grouping.
+            if terms.iter().any(|&t| postings[t as usize].is_empty()) {
+                results[qi] = "0 0".to_string();
+                continue;
+            }
+            let (mut min_t, mut min_len) = (terms[0], postings[terms[0] as usize].len());
+            for &t in &terms[1..] {
+                let l = postings[t as usize].len();
+                if l < min_len {
+                    min_t = t;
+                    min_len = l;
+                }
+            }
+            let ppos = phrases.len();
+            phrases.push(PhraseData {
+                query_idx: qi,
+                terms: terms.clone(),
+            });
+            if min_len <= anchor_thresh {
+                // Anchor path: candidates = anchor posting list.
+                for &doc in &postings[min_t as usize] {
+                    phrases_by_doc[doc as usize].push(ppos as u32);
+                }
+            } else {
+                // No anchor: intersect all phrase terms' lists first.
+                let mut cand = postings[min_t as usize].clone();
+                let mut tmp: Vec<u32> = Vec::new();
+                for &t in terms {
+                    if t == min_t {
+                        continue;
+                    }
+                    intersect(&cand, &postings[t as usize], &mut tmp);
+                    std::mem::swap(&mut cand, &mut tmp);
+                    if cand.is_empty() {
+                        break;
+                    }
+                }
+                for doc in cand {
+                    phrases_by_doc[doc as usize].push(ppos as u32);
+                }
+            }
+        }
+    }
+
+    // Second scan in parallel across the same ranges; matches merge in
+    // thread order (ascending iff ids are — same argument as postings).
+    let phrases_ref = &phrases;
+    let phrases_by_doc_ref = &phrases_by_doc;
+    let wanted_terms_ref = &parsed.wanted_terms;
+    let phrase_outs: Vec<Vec<Vec<u32>>> = std::thread::scope(|s| {
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                s.spawn(move || {
+                    phrase_range(
+                        dbuf_ref,
+                        start,
+                        end,
+                        phrases_ref,
+                        phrases_by_doc_ref,
+                        wanted_terms_ref,
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("phrase thread"))
+            .collect()
+    });
+    let mut phrase_matches: Vec<Vec<u32>> = vec![Vec::new(); phrases.len()];
+    for out in phrase_outs {
+        for (ppos, list) in out.into_iter().enumerate() {
+            phrase_matches[ppos].extend(list);
         }
     }
     if !monotonic {
