@@ -2,8 +2,20 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::sync::Mutex;
+
+#[cfg(unix)]
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+}
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+const PROT_READ: i32 = 1;
+#[cfg(unix)]
+const MAP_PRIVATE: i32 = 2;
 
 const FX_SEED: u64 = 0x517cc1b727220a95;
 
@@ -30,6 +42,8 @@ fn fx_hash(b: &[u8]) -> u64 {
     h
 }
 
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
 struct FxHasher(u64);
 impl Default for FxHasher {
     fn default() -> Self {
@@ -51,8 +65,6 @@ impl Hasher for FxHasher {
     }
 }
 
-type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
 #[inline(always)]
 fn hour_index(ts: &[u8]) -> u32 {
     let day = ((ts[8] - b'0') as u32) * 10 + (ts[9] - b'0') as u32;
@@ -63,20 +75,6 @@ fn hour_index(ts: &[u8]) -> u32 {
         1 => 30 + hour,
         _ => 54 + hour,
     }
-}
-
-fn build_hour_table() -> Vec<String> {
-    let mut v: Vec<String> = Vec::with_capacity(72);
-    for idx in 0..72u32 {
-        let s = match idx {
-            0..=5 => format!("2026-10-30T{:02}:00:00Z", idx + 18),
-            6..=29 => format!("2026-10-31T{:02}:00:00Z", idx - 6),
-            30..=53 => format!("2026-11-01T{:02}:00:00Z", idx - 30),
-            _ => format!("2026-11-02T{:02}:00:00Z", idx - 54),
-        };
-        v.push(s);
-    }
-    v
 }
 
 #[inline(always)]
@@ -203,26 +201,20 @@ impl Lats {
             Lats::Big(v) => v.len() as u64,
         }
     }
-    fn as_slice(&self) -> &[u32] {
+    fn sort_select(&mut self, rank: usize) -> u32 {
         match self {
-            Lats::Small(arr, n) => &arr[..*n as usize],
-            Lats::Big(v) => v.as_slice(),
-        }
-    }
-    fn into_vec(self) -> Vec<u32> {
-        match self {
-            Lats::Small(arr, n) => arr[..n as usize].to_vec(),
-            Lats::Big(v) => v,
+            Lats::Small(arr, n) => {
+                let n = *n as usize;
+                *arr[..n].select_nth_unstable(rank).1
+            }
+            Lats::Big(v) => *v.select_nth_unstable(rank).1,
         }
     }
 }
 
-const SHARD_BITS: usize = 10; // 1024 shards
+const SHARD_BITS: usize = 10;
 const SHARD_MASK: usize = (1 << SHARD_BITS) - 1;
 const NO_NEXT: u32 = u32::MAX;
-
-const HOT_BITS: usize = 10; // 1024 hot-cache slots per thread
-const HOT_MASK: usize = (1 << HOT_BITS) - 1;
 
 struct Slot {
     next: u32,
@@ -257,212 +249,7 @@ fn new_shards() -> Shards {
         .collect()
 }
 
-struct HotSlot {
-    hour: u8,
-    occupied: bool,
-    errors: u32,
-    ep: Vec<u8>,
-    lats: Lats,
-}
-
-impl HotSlot {
-    fn empty() -> Self {
-        HotSlot {
-            hour: 0,
-            occupied: false,
-            errors: 0,
-            ep: Vec::new(),
-            lats: Lats::Small([0; 4], 0),
-        }
-    }
-}
-
-/// Append one whole cached group to the global table under a single
-/// lock acquisition. Used for cache evictions and the end-of-thread
-/// flush, never on the per-line path.
-fn insert_group(shards: &Shards, hour: u32, ep: &[u8], lats: Lats, errors: u32) {
-    let h = fx_hash(ep);
-    let key = ((hour as u64) << 57) | (h & ((1 << 57) - 1));
-    let shard_idx = ((h ^ (hour as u64).wrapping_mul(0x9E3779B97F4A7C15)) as usize) & SHARD_MASK;
-    let shard = &shards[shard_idx];
-
-    let mut guard = shard.lock().expect("shard lock");
-    let inner = &mut *guard;
-    match inner.map.entry(key) {
-        Entry::Vacant(v) => {
-            let off = inner.arena.len() as u32;
-            inner.arena.extend_from_slice(ep);
-            inner.slots.push(Slot {
-                next: NO_NEXT,
-                off,
-                len: ep.len() as u32,
-                hour: hour as u8,
-                errors,
-                lats,
-            });
-            v.insert(inner.slots.len() as u32 - 1);
-        }
-        Entry::Occupied(mut o) => {
-            let mut sidx = *o.get();
-            loop {
-                let (next, matched) = {
-                    let s = &inner.slots[sidx as usize];
-                    let m = s.len as usize == ep.len()
-                        && inner.arena[s.off as usize..s.off as usize + s.len as usize] == ep[..];
-                    (s.next, m)
-                };
-                if matched {
-                    let s = &mut inner.slots[sidx as usize];
-                    for &lat in lats.as_slice() {
-                        s.lats.push(lat);
-                    }
-                    s.errors += errors;
-                    return;
-                }
-                if next == NO_NEXT {
-                    let off = inner.arena.len() as u32;
-                    inner.arena.extend_from_slice(ep);
-                    let new_idx = inner.slots.len() as u32;
-                    inner.slots.push(Slot {
-                        next: *o.get(),
-                        off,
-                        len: ep.len() as u32,
-                        hour: hour as u8,
-                        errors,
-                        lats,
-                    });
-                    *o.get_mut() = new_idx;
-                    return;
-                }
-                sidx = next;
-            }
-        }
-    }
-}
-
-/// Feed one line through the thread's hot cache. Hits never touch a
-/// lock or the global table; misses flush the evicted slot (batched)
-/// and cache the new line.
-fn feed_line(line: &[u8], hot: &mut [HotSlot], shards: &Shards) {
-    let hour = hour_index(line);
-    let (m_end, e_end) = find_two_spaces(line, 28);
-    let ep = &line[m_end + 1..e_end];
-    let err5 = if line[e_end + 1] == b'5' { 1 } else { 0 };
-    let lat = parse_latency(&line[e_end + 5..]) as u32;
-
-    let h = fx_hash(ep);
-    // Cache slot uses different hash bits than the shard index so the
-    // two mappings do not systematically coincide.
-    let cslot = (((h ^ (hour as u64).wrapping_mul(0x9E3779B97F4A7C15)) >> 10) as usize) & HOT_MASK;
-
-    let hit = {
-        let slot = &hot[cslot];
-        slot.occupied && slot.hour == hour as u8 && slot.ep.as_slice() == ep
-    };
-    if hit {
-        let slot = &mut hot[cslot];
-        slot.lats.push(lat);
-        slot.errors += err5;
-        return;
-    }
-    // Miss: flush the evicted occupant, then cache this line.
-    let old = std::mem::replace(&mut hot[cslot], HotSlot::empty());
-    let HotSlot {
-        hour: old_hour,
-        occupied,
-        errors: old_errors,
-        ep: old_ep,
-        lats: old_lats,
-    } = old;
-    if occupied {
-        insert_group(shards, old_hour as u32, &old_ep, old_lats, old_errors);
-    }
-    let slot = &mut hot[cslot];
-    slot.hour = hour as u8;
-    slot.occupied = true;
-    slot.errors = err5;
-    slot.ep.extend_from_slice(ep);
-    slot.lats = Lats::new(lat);
-}
-
-const CHUNK: usize = 1 << 20; // 1 MB read blocks
-
-#[inline]
-fn read_full(file: &mut File, chunk: &mut [u8], want: usize) -> usize {
-    let mut filled = 0usize;
-    while filled < want {
-        match file.read(&mut chunk[filled..want]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) => panic!("read: {e}"),
-        }
-    }
-    filled
-}
-
-/// Parse every complete line whose start offset lies in [start, end).
-fn aggregate_range(path: &str, start: u64, end: u64, shards: &Shards) {
-    let mut file = File::open(path).expect("open input");
-    let mut skip_first = false;
-    if start > 0 {
-        file.seek(SeekFrom::Start(start - 1)).expect("seek");
-        let mut b = [0u8; 1];
-        file.read_exact(&mut b).expect("peek");
-        skip_first = b[0] != b'\n';
-    }
-
-    let mut hot: Vec<HotSlot> = (0..1 << HOT_BITS).map(|_| HotSlot::empty()).collect();
-    let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; CHUNK];
-    let mut pos = start;
-    'outer: loop {
-        let mut consumed = 0usize;
-        while let Some(nl) = find_byte(&pending[consumed..], 0, b'\n') {
-            let line_start = pos;
-            if line_start >= end {
-                break 'outer;
-            }
-            let line = &pending[consumed..consumed + nl];
-            if !skip_first {
-                feed_line(line, &mut hot, shards);
-            }
-            skip_first = false;
-            pos += (nl + 1) as u64;
-            consumed += nl + 1;
-        }
-        pending.drain(..consumed);
-        let filled = read_full(&mut file, &mut chunk, CHUNK);
-        if filled == 0 {
-            if !pending.is_empty() && pos < end && !skip_first {
-                let tail = pending.clone();
-                feed_line(&tail, &mut hot, shards);
-            }
-            break;
-        }
-        pending.extend_from_slice(&chunk[..filled]);
-    }
-    // End of thread: flush every cached group to the global table.
-    for slot in hot {
-        let HotSlot {
-            hour,
-            occupied,
-            errors,
-            ep,
-            lats,
-        } = slot;
-        if occupied {
-            insert_group(shards, hour as u32, &ep, lats, errors);
-        }
-    }
-}
-
-struct KeyRow {
-    hour: u32,
-    shard: u16,
-    slot: u32,
-    off: u32,
-    len: u32,
-}
+type KeyRow = (u32, u16, u32, u32, u32);
 
 fn push_int(buf: &mut Vec<u8>, mut v: u64) {
     let mut tmp = [0u8; 20];
@@ -478,11 +265,128 @@ fn push_int(buf: &mut Vec<u8>, mut v: u64) {
     buf.extend_from_slice(&tmp[i..]);
 }
 
+type Pending = (u64, u32, u8, usize, usize, u8); // key, lat, err, ep_off, ep_len, hour
+
+fn flush_pending(pending: &mut Vec<Pending>, data: &[u8], shards: &Shards) {
+    if pending.is_empty() {
+        return;
+    }
+    // Counting sort by shard.
+    let mut buckets: Vec<Vec<Pending>> = (0..1 << SHARD_BITS)
+        .map(|_| Vec::new())
+        .collect();
+    for p in pending.drain(..) {
+        buckets[(p.0 as usize) & SHARD_MASK].push(p);
+    }
+    for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        let mut guard = shards[shard_idx].lock().expect("shard lock");
+        let inner = &mut *guard;
+        for p in bucket {
+            let ep = &data[p.3..p.3 + p.4];
+            match inner.map.entry(p.0) {
+                Entry::Vacant(v) => {
+                    let off = inner.arena.len() as u32;
+                    inner.arena.extend_from_slice(ep);
+                    inner.slots.push(Slot {
+                        next: NO_NEXT,
+                        off,
+                        len: ep.len() as u32,
+                        hour: p.5,
+                        errors: p.2 as u32,
+                        lats: Lats::new(p.1),
+                    });
+                    v.insert(inner.slots.len() as u32 - 1);
+                }
+                Entry::Occupied(mut o) => {
+                    let mut sidx = *o.get();
+                    loop {
+                        let s = &mut inner.slots[sidx as usize];
+                        if s.len as usize == ep.len()
+                            && inner.arena[s.off as usize..s.off as usize + s.len as usize] == ep[..]
+                        {
+                            s.lats.push(p.1);
+                            s.errors += p.2 as u32;
+                            break;
+                        }
+                        if s.next == NO_NEXT {
+                            let off = inner.arena.len() as u32;
+                            inner.arena.extend_from_slice(ep);
+                            let new_idx = inner.slots.len() as u32;
+                            inner.slots.push(Slot {
+                                next: *o.get(),
+                                off,
+                                len: ep.len() as u32,
+                                hour: p.5,
+                                errors: p.2 as u32,
+                                lats: Lats::new(p.1),
+                            });
+                            *o.get_mut() = new_idx;
+                            break;
+                        }
+                        sidx = s.next;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn build_hour_table() -> Vec<String> {
+    let mut v = Vec::with_capacity(72);
+    for idx in 0..72u32 {
+        v.push(match idx {
+            0..=5 => format!("2026-10-30T{:02}:00:00Z", idx + 18),
+            6..=29 => format!("2026-10-31T{:02}:00:00Z", idx - 6),
+            30..=53 => format!("2026-11-01T{:02}:00:00Z", idx - 30),
+            _ => format!("2026-11-02T{:02}:00:00Z", idx - 54),
+        });
+    }
+    v
+}
+
 fn main() {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string());
-    let path: &'static str = Box::leak(format!("{data_dir}/requests.log").into_boxed_str());
+    let path: &'static str =
+        Box::leak(format!("{data_dir}/requests.log").into_boxed_str());
     let out_path = format!("{out_dir}/summary.txt");
+
+    let file = File::open(path).expect("open input");
+    let len = file.metadata().expect("stat input").len() as usize;
+
+    if len == 0 {
+        File::create(&out_path).expect("create output");
+        return;
+    }
+
+    #[cfg(unix)]
+    let (data, _mmap_ptr, _mmap_len): (&[u8], *mut u8, usize) = {
+        let fd = file.as_raw_fd();
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+        if ptr as usize == usize::MAX {
+            panic!("mmap failed");
+        }
+        (unsafe { std::slice::from_raw_parts(ptr, len) }, ptr, len)
+    };
+    #[cfg(not(unix))]
+    let (data, _mmap_ptr, _mmap_len): (&[u8], *mut u8, usize) = {
+        let mut buf = vec![0u8; len];
+        let mut f = file;
+        let mut pos = 0usize;
+        while pos < len {
+            match <File as std::io::Read>::read(&mut f, &mut buf[pos..]) {
+                Ok(0) => break,
+                Ok(n) => pos += n,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        let ptr = buf.as_ptr() as *mut u8;
+        std::mem::forget(buf);
+        (unsafe { std::slice::from_raw_parts(ptr, len) }, ptr, len)
+    };
 
     let nthreads = std::env::var("THREADS")
         .ok()
@@ -496,25 +400,67 @@ fn main() {
         });
 
     let shards = new_shards();
-    let len = std::fs::metadata(path).expect("stat input").len();
-
-    let mut bounds: Vec<(u64, u64)> = Vec::with_capacity(nthreads);
-    for i in 0..nthreads {
-        let s = len * i as u64 / nthreads as u64;
-        let e = if i == nthreads - 1 {
-            len
-        } else {
-            len * (i + 1) as u64 / nthreads as u64
-        };
-        bounds.push((s, e));
-    }
 
     std::thread::scope(|s| {
         let shards_ref = &shards;
-        for &(a, b) in &bounds {
-            s.spawn(move || aggregate_range(path, a, b, shards_ref));
+        for i in 0..nthreads {
+            let start = i * len / nthreads;
+            let end = if i == nthreads - 1 { len } else { (i + 1) * len / nthreads };
+            s.spawn(move || {
+                let mut pos = start;
+                if pos > 0 {
+                    while pos < data.len() && data[pos - 1] != b'\n' {
+                        pos += 1;
+                    }
+                }
+                let mut pending: Vec<Pending> = Vec::with_capacity(4096);
+                while pos < end {
+                    let nl = match find_byte(data, pos, b'\n') {
+                        Some(n) => n,
+                        None => {
+                            if pos < data.len() {
+                                let line = &data[pos..];
+                                let hour = hour_index(line);
+                                let (m_end, e_end) = find_two_spaces(line, 28);
+                                let ep = &line[m_end + 1..e_end];
+                                let ep_off = ep.as_ptr() as usize - data.as_ptr() as usize;
+                                let ep_len = ep.len();
+                                let err5 = if line[e_end + 1] == b'5' { 1 } else { 0 };
+                                let lat = parse_latency(&line[e_end + 5..]) as u32;
+                                let h = fx_hash(ep);
+                                let key = ((hour as u64) << 57) | (h & ((1 << 57) - 1));
+                                pending.push((key, lat, err5, ep_off, ep_len, hour as u8));
+                            }
+                            break;
+                        }
+                    };
+                    if pos >= nl {
+                        pos = nl + 1;
+                        continue;
+                    }
+                    let line = &data[pos..nl];
+                    let hour = hour_index(line);
+                    let (m_end, e_end) = find_two_spaces(line, 28);
+                    let ep = &line[m_end + 1..e_end];
+                    let ep_off = ep.as_ptr() as usize - data.as_ptr() as usize;
+                    let ep_len = ep.len();
+                    let err5 = if line[e_end + 1] == b'5' { 1 } else { 0 };
+                    let lat = parse_latency(&line[e_end + 5..]) as u32;
+                    let h = fx_hash(ep);
+                    let key = ((hour as u64) << 57) | (h & ((1 << 57) - 1));
+                    pending.push((key, lat, err5, ep_off, ep_len, hour as u8));
+                    pos = nl + 1;
+                    if pending.len() >= 4096 {
+                        flush_pending(&mut pending, data, shards_ref);
+                    }
+                }
+                flush_pending(&mut pending, data, shards_ref);
+            });
         }
     });
+
+    #[cfg(unix)]
+    unsafe { munmap(_mmap_ptr, _mmap_len); }
 
     let mut inners: Vec<ShardInner> = shards
         .into_iter()
@@ -522,29 +468,22 @@ fn main() {
         .collect();
 
     let total_keys: usize = inners.iter().map(|i| i.slots.len()).sum();
-    let mut sort_arena: Vec<u8> = Vec::with_capacity(1 << 22);
+    let mut sort_arena: Vec<u8> = Vec::with_capacity(1 << 19);
     let mut rows: Vec<KeyRow> = Vec::with_capacity(total_keys);
     for (si, inner) in inners.iter().enumerate() {
         for (k, slot) in inner.slots.iter().enumerate() {
-            rows.push(KeyRow {
-                hour: slot.hour as u32,
-                shard: si as u16,
-                slot: k as u32,
-                off: sort_arena.len() as u32,
-                len: slot.len,
-            });
+            rows.push((slot.hour as u32, si as u16, k as u32, sort_arena.len() as u32, slot.len as u32));
             sort_arena.extend_from_slice(
                 &inner.arena[slot.off as usize..slot.off as usize + slot.len as usize],
             );
         }
     }
-    // Output order: hour ascending, then endpoint bytes ascending.
     rows.sort_unstable_by(|a, b| {
-        a.hour
-            .cmp(&b.hour)
+        a.0
+            .cmp(&b.0)
             .then_with(|| {
-                sort_arena[a.off as usize..a.off as usize + a.len as usize]
-                    .cmp(&sort_arena[b.off as usize..b.off as usize + b.len as usize])
+                sort_arena[a.3 as usize..a.3 as usize + a.4 as usize]
+                    .cmp(&sort_arena[b.3 as usize..b.3 as usize + b.4 as usize])
             })
     });
 
@@ -555,34 +494,22 @@ fn main() {
     let mut buf: Vec<u8> = Vec::with_capacity(192);
 
     for k in &rows {
-        let slot = &mut inners[k.shard as usize].slots[k.slot as usize];
-        let n = slot.lats.len() as u64;
-        let errors = slot.errors;
-        // Take the latencies out of the slot instead of copying them:
-        // the slot is never used again after this row is written.
-        let mut lat = std::mem::replace(&mut slot.lats, Lats::Small([0; 4], 0)).into_vec();
+        let s = &mut inners[k.1 as usize].slots[k.2 as usize];
+        let n = s.lats.len() as u64;
         let rank = |p: u64| -> usize { ((p * n + 99) / 100 - 1) as usize };
         let r99 = rank(99);
-        let p99 = *lat.select_nth_unstable(r99).1;
+        let p99 = s.lats.sort_select(r99);
         let r95 = rank(95).min(r99);
-        let p95 = if r95 == r99 {
-            p99
-        } else {
-            *lat[..r99].select_nth_unstable(r95).1
-        };
+        let p95 = if r95 == r99 { p99 } else { s.lats.sort_select(r95) };
         let r50 = rank(50).min(r95);
-        let p50 = if r50 == r95 {
-            p95
-        } else {
-            *lat[..r95].select_nth_unstable(r50).1
-        };
-        let ppm = errors as u64 * 1_000_000 / n;
+        let p50 = if r50 == r95 { p95 } else { s.lats.sort_select(r50) };
+        let ppm = s.errors as u64 * 1_000_000 / n;
 
         buf.clear();
-        buf.extend_from_slice(hour_table[k.hour as usize].as_bytes());
+        buf.extend_from_slice(hour_table[k.0 as usize].as_bytes());
         buf.push(b' ');
-        buf.extend_from_slice(&sort_arena[k.off as usize..k.off as usize + k.len as usize]);
-        for v in [n, p50 as u64, p95 as u64, p99 as u64, errors as u64, ppm] {
+        buf.extend_from_slice(&sort_arena[k.3 as usize..k.3 as usize + k.4 as usize]);
+        for v in [n, p50 as u64, p95 as u64, p99 as u64, s.errors as u64, ppm] {
             buf.push(b' ');
             push_int(&mut buf, v);
         }
