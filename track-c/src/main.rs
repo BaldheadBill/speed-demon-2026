@@ -1,15 +1,25 @@
-// Track C solver v1 — written fresh in the 72-hour window (no October code).
+// Track C solver v2 — from v1 (hash-verified on full data).
 // Byte state machine over the whole records.csv buffer, direct-array join
 // on region_id, exact integer-cents money, interned names. Zero crates.
 // Contract: reads /data/records.csv + /data/regions.csv, writes exactly
-// one file /out/aggregates.txt, exits 0. Single-threaded by design: the
-// byte scan, not the join, is the bottleneck, and a hostile CSV split
-// across threads is hash risk for a stretch track.
+// one file /out/aggregates.txt, exits 0.
+//
+// v2 parallelizes the record scan without changing its parsing by one
+// byte: the quote state at any buffer position equals the PARITY of '"'
+// bytes before it (every quote toggles in/out; a "" escape toggles twice),
+// so each thread can locate the first record start inside its chunk from
+// the chunk's starting parity alone. Records are parsed by the identical
+// field/delim state machine; aggregation is order-independent (integer
+// sums, min/max, distinct name-id sets), so per-thread partial groups
+// merge to exactly the single-threaded result. Name interning uses a
+// 64-way sharded lock so the shared table does not serialize the scan.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufWriter, Read, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------- FxHash
 
@@ -56,9 +66,12 @@ type FxSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 // ---------------------------------------------------------------- input
 
+// Exact-size read: the records file is hundreds of MB, and growing a Vec
+// by doubling risks a transient double allocation at peak.
 fn read_file(path: &str) -> Vec<u8> {
     let mut f = File::open(path).expect("open input");
-    let mut buf = Vec::new();
+    let len = f.metadata().expect("stat input").len() as usize;
+    let mut buf = Vec::with_capacity(len);
     f.read_to_end(&mut buf).expect("read input");
     buf
 }
@@ -280,15 +293,38 @@ impl Group {
     }
 }
 
-// Intern a name's exact bytes; returns its small integer id. The empty
-// name (unquoted empty and "" alike) interns once, like any other value.
-fn intern_name(map: &mut FxMap<Box<[u8]>, u32>, bytes: &[u8]) -> u32 {
-    if let Some(&id) = map.get(bytes) {
-        return id;
+// Global name intern table, sharded by name hash so parallel scan threads
+// can intern without serializing on a single lock. Ids only need to be
+// distinct (groups store id sets and print the set length).
+const NAME_SHARDS: usize = 64;
+
+struct Names {
+    shards: Vec<Mutex<FxMap<Box<[u8]>, u32>>>,
+    next_id: AtomicU32,
+}
+
+impl Names {
+    fn new() -> Names {
+        Names {
+            shards: (0..NAME_SHARDS)
+                .map(|_| Mutex::new(FxMap::default()))
+                .collect(),
+            next_id: AtomicU32::new(0),
+        }
     }
-    let id = map.len() as u32;
-    map.insert(bytes.into(), id);
-    id
+
+    fn intern(&self, bytes: &[u8]) -> u32 {
+        let mut h = FxHasher::default();
+        h.write(bytes);
+        let shard = &self.shards[(h.finish() as usize) & (NAME_SHARDS - 1)];
+        let mut m = shard.lock().expect("names shard lock");
+        if let Some(&id) = m.get(bytes) {
+            return id;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        m.insert(bytes.into(), id);
+        id
+    }
 }
 
 // ---------------------------------------------------------------- regions
@@ -363,6 +399,151 @@ fn parse_regions(buf: &[u8]) -> (Vec<[u8; 3]>, Vec<i32>) {
     (countries, table)
 }
 
+// ---------------------------------------------------------------- parallel scan
+
+// Quote state at a position is the parity of '"' bytes before it: every
+// quote toggles in/out (a "" escape toggles twice), and in valid files
+// quotes appear nowhere else. True = inside a quoted field.
+fn quote_parity(buf: &[u8], start: usize, end: usize) -> bool {
+    let mut inside = false;
+    for &c in &buf[start..end] {
+        if c == b'"' {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+// First record start at or after `from`, given the quote state at `from`.
+// A record starts right after a terminator (LF or CRLF) outside quotes;
+// `from` itself qualifies when it sits directly after a terminator (or is
+// the first record position) with quotes closed. Panics on the same
+// malformed inputs the record parser would reject (bare CR outside
+// quotes, unterminated quoted field).
+fn first_record_start(buf: &[u8], from: usize, first_pos: usize, inside: bool) -> usize {
+    if !inside && (from == first_pos || buf[from - 1] == b'\n') {
+        return from;
+    }
+    let mut p = from;
+    let mut inq = inside;
+    while p < buf.len() {
+        let c = buf[p];
+        if inq {
+            if c == b'"' {
+                inq = false;
+            }
+            p += 1;
+        } else if c == b'"' {
+            inq = true;
+            p += 1;
+        } else if c == b'\n' {
+            return p + 1;
+        } else if c == b'\r' {
+            if p + 1 >= buf.len() || buf[p + 1] != b'\n' {
+                panic!("bare CR outside quotes");
+            }
+            return p + 2;
+        } else {
+            p += 1;
+        }
+    }
+    if inq {
+        panic!("unterminated quoted field");
+    }
+    buf.len()
+}
+
+// Parse every record that STARTS in [start, range_end); a record may
+// extend past range_end into a neighbouring chunk (the buffer is shared
+// read-only, so this is safe). The loop body is the identical v1 state
+// machine; only the group and name destinations are per-call.
+fn scan_records(
+    buf: &[u8],
+    start: usize,
+    range_end: usize,
+    table: &[i32],
+    unmatched_idx: usize,
+    names: &Names,
+    groups: &mut [Group],
+    scratch: &mut Vec<u8>,
+) -> u64 {
+    let mut pos = start;
+    let mut n_records = 0u64;
+    while pos < range_end {
+        // BOM immediately after a record terminator is skipped, once.
+        // A second consecutive BOM would land in the id field and fail
+        // the digit check below, exactly as the spec's invalid case.
+        if buf[pos..].starts_with(BOM) {
+            pos += BOM.len();
+            if pos >= buf.len() {
+                break;
+            }
+        }
+        // Field 1: id.
+        let (q1, v1, p1) = scan_field(buf, pos, Some(scratch));
+        let id_bytes = field_value(buf, pos, q1, v1, scratch);
+        let id = parse_uint(id_bytes) as i64;
+        pos = match delim(buf, p1, 1) {
+            Delim::Comma(next) => next,
+            Delim::End(_) => panic!("record ends after field 1"),
+        };
+        // Field 2: name (interned for distinct counting).
+        let (q2, v2, p2) = scan_field(buf, pos, Some(scratch));
+        let name_bytes = field_value(buf, pos, q2, v2, scratch);
+        let name_id = names.intern(name_bytes);
+        let name_len = v2 as u64;
+        pos = match delim(buf, p2, 2) {
+            Delim::Comma(next) => next,
+            Delim::End(_) => panic!("record ends after field 2"),
+        };
+        // Field 3: note (byte length only).
+        let (_q3, v3, p3) = scan_field(buf, pos, None);
+        let note_len = v3 as u64;
+        pos = match delim(buf, p3, 3) {
+            Delim::Comma(next) => next,
+            Delim::End(_) => panic!("record ends after field 3"),
+        };
+        // Field 4: region_id.
+        let (q4, v4, p4) = scan_field(buf, pos, Some(scratch));
+        let region_bytes = field_value(buf, pos, q4, v4, scratch);
+        let region_id = parse_uint(region_bytes);
+        pos = match delim(buf, p4, 4) {
+            Delim::Comma(next) => next,
+            Delim::End(_) => panic!("record ends after field 4"),
+        };
+        // Field 5: amount.
+        let (q5, v5, p5) = scan_field(buf, pos, Some(scratch));
+        let amount_bytes = field_value(buf, pos, q5, v5, scratch);
+        let cents = parse_cents(amount_bytes);
+        pos = match delim(buf, p5, 5) {
+            Delim::Comma(_) => panic!("record has more than 5 fields"),
+            Delim::End(next) => next,
+        };
+
+        // ---- join + aggregate ----
+        let gidx = if (region_id as usize) < table.len() && table[region_id as usize] >= 0 {
+            table[region_id as usize] as usize
+        } else {
+            unmatched_idx
+        };
+        let g = &mut groups[gidx];
+        g.count += 1;
+        g.id_sum += id;
+        g.amount_sum += cents;
+        if cents < g.amount_min {
+            g.amount_min = cents;
+        }
+        if cents > g.amount_max {
+            g.amount_max = cents;
+        }
+        g.names.insert(name_id);
+        g.name_bytes += name_len;
+        g.note_bytes += note_len;
+        n_records += 1;
+    }
+    n_records
+}
+
 // ---------------------------------------------------------------- main
 
 fn main() {
@@ -370,10 +551,7 @@ fn main() {
     let rbuf = read_file("/data/regions.csv");
     let (countries, table) = parse_regions(&rbuf);
     let unmatched_idx = countries.len();
-    let mut groups: Vec<Group> = Vec::new();
-    for _ in 0..=countries.len() {
-        groups.push(Group::new());
-    }
+    let n_groups = countries.len() + 1;
 
     // ---- records: byte state machine over the whole buffer ----
     let buf = read_file("/data/records.csv");
@@ -412,89 +590,114 @@ fn main() {
     }
     pos = hpos;
 
-    let mut names_map: FxMap<Box<[u8]>, u32> = FxMap::default();
-    let mut n_records: u64 = 0;
-    while pos < buf.len() {
-        // BOM immediately after a record terminator is skipped, once.
-        // A second consecutive BOM would land in the id field and fail
-        // the digit check below, exactly as the spec's invalid case.
-        if buf[pos..].starts_with(BOM) {
-            pos += BOM.len();
-            if pos >= buf.len() {
-                break;
+    // ---- parallel scan: chunk by byte range, resync to a record start ----
+    let nthreads = std::env::var("THREADS")
+        .ok()
+        .and_then(|t| t.parse::<usize>().ok())
+        .filter(|&t| t >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(12)
+        });
+    // Spawning threads costs more than a small file is worth.
+    let nthreads = if buf.len() - pos < 1 << 20 { 1 } else { nthreads };
+    let n_records: u64;
+    let mut merged: Vec<Group> = (0..n_groups).map(|_| Group::new()).collect();
+
+    if nthreads == 1 {
+        let names = Names::new();
+        n_records = scan_records(
+            &buf, pos, buf.len(), &table, unmatched_idx, &names, &mut merged, &mut scratch,
+        );
+    } else {
+        // Chunk [pos, len) into nthreads byte ranges.
+        let len = buf.len();
+        let span = len - pos;
+        let ranges: Vec<(usize, usize)> = (0..nthreads)
+            .map(|i| {
+                let start = pos + i * span / nthreads;
+                let end = if i + 1 == nthreads {
+                    len
+                } else {
+                    pos + (i + 1) * span / nthreads
+                };
+                (start, end)
+            })
+            .collect();
+
+        // Pass 1 (parallel): quote parity of every range.
+        let buf_ref = &buf;
+        let parities: Vec<bool> = std::thread::scope(|s| {
+            ranges
+                .iter()
+                .map(|&(start, end)| {
+                    let buf_ref = buf_ref;
+                    s.spawn(move || quote_parity(buf_ref, start, end))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("parity thread"))
+                .collect()
+        });
+
+        // Quote state at each range start (parity of everything before it).
+        let states: Vec<bool> = {
+            let mut v = Vec::with_capacity(nthreads + 1);
+            let mut acc = quote_parity(&buf, 0, pos);
+            v.push(acc);
+            for &p in &parities {
+                acc ^= p;
+                v.push(acc);
             }
-        }
-        // Field 1: id.
-        let (q1, v1, p1) = scan_field(&buf, pos, Some(&mut scratch));
-        let id_bytes = field_value(&buf, pos, q1, v1, &scratch);
-        let id = parse_uint(id_bytes) as i64;
-        pos = match delim(&buf, p1, 1) {
-            Delim::Comma(next) => next,
-            Delim::End(_) => panic!("record ends after field 1"),
-        };
-        // Field 2: name (interned for distinct counting).
-        let (q2, v2, p2) = scan_field(&buf, pos, Some(&mut scratch));
-        let name_bytes = field_value(&buf, pos, q2, v2, &scratch);
-        let name_id = intern_name(&mut names_map, name_bytes);
-        let name_len = v2 as u64;
-        pos = match delim(&buf, p2, 2) {
-            Delim::Comma(next) => next,
-            Delim::End(_) => panic!("record ends after field 2"),
-        };
-        // Field 3: note (byte length only).
-        let (_q3, v3, p3) = scan_field(&buf, pos, None);
-        let note_len = v3 as u64;
-        pos = match delim(&buf, p3, 3) {
-            Delim::Comma(next) => next,
-            Delim::End(_) => panic!("record ends after field 3"),
-        };
-        // Field 4: region_id.
-        let (q4, v4, p4) = scan_field(&buf, pos, Some(&mut scratch));
-        let region_bytes = field_value(&buf, pos, q4, v4, &scratch);
-        let region_id = parse_uint(region_bytes);
-        pos = match delim(&buf, p4, 4) {
-            Delim::Comma(next) => next,
-            Delim::End(_) => panic!("record ends after field 4"),
-        };
-        // Field 5: amount.
-        let (q5, v5, p5) = scan_field(&buf, pos, Some(&mut scratch));
-        let amount_bytes = field_value(&buf, pos, q5, v5, &scratch);
-        let cents = parse_cents(amount_bytes);
-        pos = match delim(&buf, p5, 5) {
-            Delim::Comma(_) => panic!("record has more than 5 fields"),
-            Delim::End(next) => next,
+            v
         };
 
-        // ---- join + aggregate ----
-        let gidx = if (region_id as usize) < table.len() && table[region_id as usize] >= 0 {
-            table[region_id as usize] as usize
-        } else {
-            unmatched_idx
-        };
-        let g = &mut groups[gidx];
-        g.count += 1;
-        g.id_sum += id;
-        g.amount_sum += cents;
-        if cents < g.amount_min {
-            g.amount_min = cents;
+        // Pass 2 (parallel): parse records starting in each range.
+        let names = Names::new();
+        let table_ref = &table;
+        let partials: Vec<(u64, Vec<Group>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .enumerate()
+                .map(|(i, &(start, end))| {
+                    let buf_ref = buf_ref;
+                    let names_ref = &names;
+                    let table_ref = table_ref;
+                    let state = states[i];
+                    s.spawn(move || {
+                        let first = first_record_start(buf_ref, start, pos, state);
+                        let mut groups: Vec<Group> = (0..n_groups).map(|_| Group::new()).collect();
+                        let mut scratch = Vec::new();
+                        let n = scan_records(
+                            buf_ref, first, end, table_ref, unmatched_idx, names_ref,
+                            &mut groups, &mut scratch,
+                        );
+                        (n, groups)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("scan thread"))
+                .collect()
+        });
+
+        n_records = partials.iter().map(|p| p.0).sum();
+        for (_, groups) in partials {
+            merge_groups(&mut merged, groups);
         }
-        if cents > g.amount_max {
-            g.amount_max = cents;
-        }
-        g.names.insert(name_id);
-        g.name_bytes += name_len;
-        g.note_bytes += note_len;
-        n_records += 1;
     }
 
     // ---- output: bytewise key sort, _UNMATCHED last by construction ----
     let mut keys: Vec<(&[u8], usize)> = Vec::new();
     for (i, code) in countries.iter().enumerate() {
-        if groups[i].count > 0 {
+        if merged[i].count > 0 {
             keys.push((code, i));
         }
     }
-    if groups[unmatched_idx].count > 0 {
+    if merged[unmatched_idx].count > 0 {
         keys.push((b"_UNMATCHED", unmatched_idx));
     }
     keys.sort_by(|a, b| a.0.cmp(b.0));
@@ -502,7 +705,7 @@ fn main() {
     let out = File::create("/out/aggregates.txt").expect("create output");
     let mut w = BufWriter::new(out);
     for (key, gi) in &keys {
-        let g = &groups[*gi];
+        let g = &merged[*gi];
         let mut line = String::new();
         line.push_str(&String::from_utf8_lossy(key));
         line.push(' ');
@@ -526,4 +729,19 @@ fn main() {
     }
     w.flush().expect("flush");
     eprintln!("records={} groups={}", n_records, keys.len());
+}
+
+// Merge per-thread partial groups into `merged`. All fields are pure
+// integer arithmetic or set union, so the merge order cannot matter.
+fn merge_groups(merged: &mut [Group], partial: Vec<Group>) {
+    for (g, p) in merged.iter_mut().zip(partial) {
+        g.count += p.count;
+        g.id_sum += p.id_sum;
+        g.amount_sum += p.amount_sum;
+        g.amount_min = g.amount_min.min(p.amount_min);
+        g.amount_max = g.amount_max.max(p.amount_max);
+        g.names.extend(p.names);
+        g.name_bytes += p.name_bytes;
+        g.note_bytes += p.note_bytes;
+    }
 }
